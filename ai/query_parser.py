@@ -31,6 +31,16 @@ MEMORY_TURNS = 5      # user+assistant pairs kept in context
 KEEP_ALIVE = "30m"    # keep the model resident in Ollama between turns (avoids
                       # multi-second cold reloads when the user keeps chatting)
 
+# Generation options for the tool-calling loop.
+#   num_ctx     — the system prompt + tool defs alone are ~2200 tokens, which
+#                 overflows Ollama's 2048 default and silently truncates the
+#                 rules. 8192 gives ample headroom (the model supports 131k).
+#   temperature — low for reliable, repeatable tool selection (this is a
+#                 deterministic DB assistant, not creative writing).
+#   num_predict — cap runaway generations (a stuck model can otherwise emit
+#                 hundreds of filler tokens); normal replies are well under this.
+TOOL_LOOP_OPTIONS = {"num_ctx": 8192, "temperature": 0.1, "num_predict": 1024}
+
 
 def _system_prompt(user_id: int, sm: SchemaManager, rag_context: str = "",
                    active_table: str = "", billing=None) -> str:
@@ -283,6 +293,7 @@ class ChatEngine:
                 messages=messages,
                 tools=tools,
                 keep_alive=KEEP_ALIVE,
+                options=TOOL_LOOP_OPTIONS,
             )
             msg = response.message
 
@@ -551,7 +562,7 @@ class ChatEngine:
             "content": "Please give a brief summary of what was just done.",
         })
         response = ollama.chat(model=self.model, messages=messages,
-                               keep_alive=KEEP_ALIVE)
+                               keep_alive=KEEP_ALIVE, options=TOOL_LOOP_OPTIONS)
         return _clean_reply(response.message.content or ""), all_tools
 
 
