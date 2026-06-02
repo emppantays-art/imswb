@@ -28,6 +28,18 @@ if TYPE_CHECKING:
 DEFAULT_MODEL = "llama3.2:3b"
 MAX_TOOL_ROUNDS = 8   # caps multi-step chains (e.g. query-then-update)
 MEMORY_TURNS = 5      # user+assistant pairs kept in context
+KEEP_ALIVE = "30m"    # keep the model resident in Ollama between turns (avoids
+                      # multi-second cold reloads when the user keeps chatting)
+
+# Generation options for the tool-calling loop.
+#   num_ctx     — the system prompt + tool defs alone are ~2200 tokens, which
+#                 overflows Ollama's 2048 default and silently truncates the
+#                 rules. 8192 gives ample headroom (the model supports 131k).
+#   temperature — low for reliable, repeatable tool selection (this is a
+#                 deterministic DB assistant, not creative writing).
+#   num_predict — cap runaway generations (a stuck model can otherwise emit
+#                 hundreds of filler tokens); normal replies are well under this.
+TOOL_LOOP_OPTIONS = {"num_ctx": 8192, "temperature": 0.1, "num_predict": 1024}
 
 
 def _system_prompt(user_id: int, sm: SchemaManager, rag_context: str = "",
@@ -183,6 +195,7 @@ class ChatEngine:
         all_tools: List[ToolResult] = []
         _update_nudge_sent = False
         _in_update_flow = False   # True after retryable update_data failure → suppress post-query nudge
+        _schema_dirty = False     # set when create_table/add_column runs → rebuild tools only then
 
         # Pre-flight: detect explicit nonexistent-table mention in the user message
         # e.g. "records in the employees table" or "Ghost to the readers table"
@@ -279,6 +292,8 @@ class ChatEngine:
                 model=self.model,
                 messages=messages,
                 tools=tools,
+                keep_alive=KEEP_ALIVE,
+                options=TOOL_LOOP_OPTIONS,
             )
             msg = response.message
 
@@ -312,6 +327,8 @@ class ChatEngine:
                 result = execute_tool(name, args, user_id, self.sm, self.crud,
                                      default_table=active_table, billing=self.billing)
                 all_tools.append(result)
+                if name in ("create_table", "add_column") and result.success:
+                    _schema_dirty = True
 
                 messages.append({
                     "role": "tool",
@@ -340,7 +357,8 @@ class ChatEngine:
                             "Confirm to the user what was changed."
                         )},
                     ]
-                    _confirm = ollama.chat(model=self.model, messages=_simple_upd)
+                    _confirm = ollama.chat(model=self.model, messages=_simple_upd,
+                                           keep_alive=KEEP_ALIVE)
                     _text = _clean_reply(_confirm.message.content or "")
                     if not _text:
                         _text = f"Updated {_tbl} record {_rec}: {_changes}."
@@ -493,6 +511,7 @@ class ChatEngine:
                 _confirm2 = ollama.chat(
                     model=self.model, messages=_simple2,
                     options={"temperature": 0},
+                    keep_alive=KEEP_ALIVE,
                 )
                 _raw2  = _confirm2.message.content or ""
                 _text2 = _clean_reply(_raw2)
@@ -530,15 +549,20 @@ class ChatEngine:
                     return f"No records found matching {_flt_desc}.", all_tools
                 return f"No records found in '{_tbl}'.", all_tools
 
-            # Rebuild: schema may have changed if create_table / add_column ran
-            tools = build_tools(user_id, self.sm, billing=self.billing)
+            # Rebuild tools ONLY when the schema actually changed this round.
+            # Otherwise the tool definitions are identical, so re-querying the full
+            # schema every round (≈8 schema reads per table) is pure overhead.
+            if _schema_dirty:
+                tools = build_tools(user_id, self.sm, billing=self.billing)
+                _schema_dirty = False
 
         # ── exceeded max rounds ───────────────────────────────────────────────
         messages.append({
             "role": "user",
             "content": "Please give a brief summary of what was just done.",
         })
-        response = ollama.chat(model=self.model, messages=messages)
+        response = ollama.chat(model=self.model, messages=messages,
+                               keep_alive=KEEP_ALIVE, options=TOOL_LOOP_OPTIONS)
         return _clean_reply(response.message.content or ""), all_tools
 
 

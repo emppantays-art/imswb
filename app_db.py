@@ -48,6 +48,36 @@ def _init():
 sm, crud, rag_engine, billing = _init()
 csv_imp = CSVImporter(sm, crud)
 
+# ─── cached metadata reads ────────────────────────────────────────────────────
+# Streamlit reruns the whole script on every interaction. Without caching, the
+# sidebar + dashboard re-open a SQLite connection for every table on every click
+# (get_user_tables + a COUNT(*) per table + schema lookups). These caches collapse
+# that to one query per (user, table) until a write invalidates them.
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_tables(user_id: int):
+    return sm.get_user_tables(user_id)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_count(user_id: int, table_name: str):
+    return crud.count_records(user_id, table_name)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_schema(user_id: int, table_name: str):
+    return sm.get_table_schema(user_id, table_name)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_rows(user_id: int, table_name: str, limit: int = 500):
+    """Full row set for a table — re-queried on every rerun without this cache."""
+    return crud.query_table(user_id, table_name, limit=limit)
+
+def _invalidate_caches():
+    """Clear cached metadata + rows after any write so the UI reflects changes at once."""
+    _cached_tables.clear()
+    _cached_count.clear()
+    _cached_schema.clear()
+    _cached_rows.clear()
+
 # ─── session state helpers ────────────────────────────────────────────────────
 
 def _ss(key, default):
@@ -173,11 +203,11 @@ def sidebar():
         st.divider()
         st.caption("MY TABLES")
 
-        tables = sm.get_user_tables(user["id"])
+        tables = _cached_tables(user["id"])
         if not tables:
             st.caption("None yet")
         for t in tables:
-            n = crud.count_records(user["id"], t["table_name"])
+            n = _cached_count(user["id"], t["table_name"])
             label = f"{t['table_name']}  ({n})"
             active = st.session_state.active_table == t["table_name"]
             if st.button(label, key=f"nav_{t['table_name']}",
@@ -193,7 +223,7 @@ def sidebar():
 def dashboard_view():
     user_id = st.session_state.user["id"]
     st.title("Dashboard")
-    tables = sm.get_user_tables(user_id)
+    tables = _cached_tables(user_id)
 
     if not tables:
         st.info("No tables yet. Click **＋ New Table** in the sidebar to create one.")
@@ -201,8 +231,8 @@ def dashboard_view():
 
     cols = st.columns(min(3, len(tables)))
     for i, t in enumerate(tables):
-        n = crud.count_records(user_id, t["table_name"])
-        schema = sm.get_table_schema(user_id, t["table_name"]) or []
+        n = _cached_count(user_id, t["table_name"])
+        schema = _cached_schema(user_id, t["table_name"]) or []
         with cols[i % 3]:
             with st.container(border=True):
                 st.markdown(f"#### {t['table_name']}")
@@ -291,6 +321,7 @@ def _do_create_table(user_id: int, table_name: str, num: int):
 
     try:
         sm.create_dynamic_table(user_id, table_name, columns_schema)
+        _invalidate_caches()
         # clean widget keys
         for i in range(num):
             for p in ("cn_", "ct_", "cr_", "cd_"):
@@ -308,7 +339,7 @@ def _do_create_table(user_id: int, table_name: str, num: int):
 def table_view():
     user_id = st.session_state.user["id"]
     table_name = st.session_state.active_table
-    schema = sm.get_table_schema(user_id, table_name)
+    schema = _cached_schema(user_id, table_name)
 
     if schema is None:
         st.error("Table not found")
@@ -327,18 +358,21 @@ def table_view():
 # ── Data tab ──────────────────────────────────────────────────────────────────
 
 def _tab_data(user_id, table_name, schema):
-    records = crud.query_table(user_id, table_name)
+    records = _cached_rows(user_id, table_name)
 
     hdr, btn_refresh, btn_export, btn_index = st.columns([3, 1, 1, 1])
     hdr.caption(f"{len(records)} records")
     if btn_refresh.button("↻ Refresh", key="btn_refresh"):
+        _cached_rows.clear()   # force a fresh read on explicit refresh
         st.rerun()
 
     if btn_index.button("🔍 Re-index", key="btn_reindex",
                         help="Update RAG search index for this table"):
         with st.spinner("Indexing…"):
             n = rag_engine.index_table(user_id, table_name)
-        st.toast(f"Indexed {n} rows from '{table_name}'", icon="🔍")
+        msg = (f"Re-embedded {n} new/changed row(s) in '{table_name}'"
+               if n else f"'{table_name}' already up to date")
+        st.toast(msg, icon="🔍")
 
     if not records:
         st.info("No records yet — use the **Insert** tab to add data.")
@@ -384,6 +418,7 @@ def _tab_data(user_id, table_name, schema):
         if do_save:
             try:
                 crud.update_record(user_id, table_name, chosen_id, edits)
+                _invalidate_caches()
                 _queue_toast(f"Record {chosen_id} updated")
                 st.rerun()
             except Exception as e:
@@ -391,6 +426,7 @@ def _tab_data(user_id, table_name, schema):
 
         if do_del:
             crud.delete_record(user_id, table_name, chosen_id)
+            _invalidate_caches()
             _queue_toast(f"Record {chosen_id} deleted", icon="🗑️")
             st.rerun()
 
@@ -412,6 +448,7 @@ def _tab_insert(user_id, table_name, schema):
                      if v is not None and v != ""}
             try:
                 new_id = crud.insert_record(user_id, table_name, clean)
+                _invalidate_caches()
                 _queue_toast(f"Record inserted  (id = {new_id})", icon="➕")
                 st.rerun()
             except Exception as e:
@@ -501,6 +538,7 @@ def _tab_add_col(user_id, table_name, schema):
                             "default": new_default.strip() or None,
                         },
                     )
+                    _invalidate_caches()
                     _queue_toast(f"Column '{new_name}' added")
                     st.rerun()
                 except ValueError as e:
@@ -516,6 +554,7 @@ def _tab_danger(user_id, table_name):
         if confirm.strip() == table_name:
             sm.drop_table(user_id, table_name)
             rag_engine.remove_table(user_id, table_name)
+            _invalidate_caches()
             _queue_toast(f"Table '{table_name}' dropped", icon="🗑️")
             st.session_state.update(view="dashboard", active_table=None)
             st.rerun()
@@ -648,10 +687,12 @@ def chat_view():
             with st.spinner("Indexing all tables…"):
                 result = rag_engine.index_all_tables(user_id)
             total = sum(v for v in result.values() if isinstance(v, int))
-            st.toast(f"Indexed {total} rows across {len(result)} tables", icon="🔍")
+            msg = (f"Re-embedded {total} new/changed row(s) across {len(result)} tables"
+                   if total else "All tables already up to date")
+            st.toast(msg, icon="🔍")
 
     # ── active table selector ─────────────────────────────────────────────────
-    tables = sm.get_user_tables(user_id)
+    tables = _cached_tables(user_id)
     if tables:
         _NONE = "— none —"
         _table_options = [_NONE] + [t["table_name"] for t in tables]
@@ -745,6 +786,12 @@ def chat_view():
 
         if tool_results:
             _render_tool_results([tr.__dict__ for tr in tool_results])
+            # A chat turn can create tables / insert / update / create invoices,
+            # so refresh the cached metadata if any mutating tool ran.
+            _MUTATING = {"add_data", "update_data", "create_table",
+                         "add_column", "create_invoice"}
+            if any(tr.name in _MUTATING and tr.success for tr in tool_results):
+                _invalidate_caches()
         st.markdown(reply)
 
     # persist
@@ -806,7 +853,7 @@ def import_csv_view():
     # ── configuration ─────────────────────────────────────────────────────────
     st.markdown("#### Configure Import")
 
-    existing_tables = [t["table_name"] for t in sm.get_user_tables(user_id)]
+    existing_tables = [t["table_name"] for t in _cached_tables(user_id)]
     mode = st.radio(
         "Mode",
         ["Create new table", "Append to existing table"],
@@ -871,6 +918,7 @@ def _do_csv_import(user_id, preview, table_name, col_types, mode):
         return
 
     safe_name = _safe_name(table_name)
+    _invalidate_caches()
     msg = f"Imported **{result['rows_imported']} rows** into `{safe_name}`"
     if result["rows_failed"]:
         msg += f" ({result['rows_failed']} rows skipped)"
@@ -949,7 +997,7 @@ def billing_view():
 
     with left:
         st.subheader("Products")
-        products = crud.query_table(user_id, sel_table, limit=200)
+        products = _cached_rows(user_id, sel_table, 200)
         if not products:
             st.info("No products in this table.")
         else:
@@ -1014,6 +1062,7 @@ def billing_view():
                         invoice = billing.create_invoice(
                             user_id, sel_table, items_list, customer.strip()
                         )
+                        _invalidate_caches()   # stock reduced + invoices row added
                         st.session_state.billing_cart  = {}
                         st.session_state.last_invoice  = invoice
                         _queue_toast(
@@ -1063,7 +1112,7 @@ def main():
             result  = rag_engine.index_all_tables(user_id)
             total   = sum(v for v in result.values() if isinstance(v, int))
             if total:
-                _queue_toast(f"RAG index refreshed — {total} rows", icon="🔍")
+                _queue_toast(f"RAG index updated — {total} new/changed rows", icon="🔍")
         except Exception:
             pass  # Never block login on indexing failure
 
