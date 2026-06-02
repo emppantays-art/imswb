@@ -225,20 +225,22 @@ async def t_add_column(page: Page):
 
 @test("CSV import — Upload and create new table")
 async def t_csv_import(page: Page):
-    import tempfile, os
+    import os, sys
     await _login(page)
     await page.get_by_role("button", name="📁 CSV").click()
     await page.wait_for_timeout(1500)
 
-    # Write a temp CSV
-    csv_content = "product,price_usd,qty\nWidget,4.99,20\nGadget,12.50,8\n"
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-    tmp.write(csv_content); tmp.flush(); tmp.close()
+    # Use a FIXED, recognizable filename so the created table is named
+    # 'pw_csv_test' (not a random tmpXXXX). A random temp name would pollute
+    # the live data/ dir with junk tables that bloat the chat schema context.
+    csv_path = "/tmp/pw_csv_test.csv"
+    with open(csv_path, "w") as f:
+        f.write("product,price_usd,qty\nWidget,4.99,20\nGadget,12.50,8\n")
 
     uploader = page.locator('input[type="file"]')
-    await uploader.set_input_files(tmp.name)
+    await uploader.set_input_files(csv_path)
     await page.wait_for_timeout(2500)
-    os.unlink(tmp.name)
+    os.unlink(csv_path)
 
     content = await page.content()
     assert "2 rows" in content or "Widget" in content, "CSV preview not shown"
@@ -250,6 +252,22 @@ async def t_csv_import(page: Page):
     await ss(page, "csv_imported")
     content = await page.content()
     assert "Widget" in content or "Imported" in content or "product" in content.lower()
+
+    # Clean up: drop the imported table so it does not pollute the live data/ dir
+    # and bloat the chat model's schema context on later runs.
+    sys.path.insert(0, ".")
+    from database.schema_manager import SchemaManager
+    from database.dynamic_crud import DynamicCRUD
+    from ai.rag_engine import RAGEngine
+    _sm  = SchemaManager(base_dir="data")
+    _rag = RAGEngine(_sm, DynamicCRUD(_sm))
+    _uid = _sm.authenticate_user(USER, PASS)["id"]
+    for _t in _sm.get_user_tables(_uid):
+        nm = _t["table_name"]
+        if nm == "pw_csv_test" or nm.startswith("tmp"):
+            _sm.drop_table(_uid, nm)
+            try: _rag.remove_table(_uid, nm)
+            except Exception: pass
 
 
 @test("Billing — nav button visible after login")
