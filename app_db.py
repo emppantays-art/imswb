@@ -14,7 +14,7 @@ from database.schema_manager import VALID_COLUMN_TYPES, SchemaManager, _safe_nam
 from database.dynamic_crud import DynamicCRUD
 from ai.query_parser import ChatEngine, trim_history, DEFAULT_MODEL, MEMORY_TURNS
 from ai.rag_engine import RAGEngine
-from billing_dynamic import DynamicBillingSystem
+from billing_dynamic import DynamicBillingSystem, to_number, to_stock
 from csv_importer import CSVImporter, VALID_TYPES as CSV_TYPES
 
 # ─── page config ─────────────────────────────────────────────────────────────
@@ -1003,10 +1003,12 @@ def billing_view():
         else:
             for prod in products:
                 item_name  = str(prod.get(cols["name"], "?"))
-                unit_price = float(prod.get(cols["price"]) or 0)
+                unit_price = to_number(prod.get(cols["price"]))
                 stock_txt  = ""
-                if cols["stock"] and prod.get(cols["stock"]) is not None:
-                    stock_txt = f"  *(stock: {int(float(prod[cols['stock']]))})*"
+                if cols["stock"]:
+                    _s = to_stock(prod.get(cols["stock"]))
+                    if _s is not None:
+                        stock_txt = f"  *(stock: {_s})*"
                 pc1, pc2, pc3 = st.columns([4, 1, 1])
                 pc1.markdown(f"**{item_name}** — ${unit_price:.2f}{stock_txt}")
                 qty_key = f"bqty_{sel_table}_{prod['id']}"
@@ -1084,7 +1086,7 @@ def billing_view():
                 "Invoice ID":   inv.get("invoice_id", ""),
                 "Customer":     inv.get("customer_name", ""),
                 "Table":        inv.get("source_table", ""),
-                "Total":        f"${float(inv.get('total', 0)):.2f}",
+                "Total":        f"${to_number(inv.get('total')):.2f}",
                 "Date":         inv.get("date", ""),
                 "Status":       inv.get("status", ""),
             })
