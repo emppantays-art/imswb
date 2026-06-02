@@ -7,6 +7,7 @@ no hardcoded table or column names required.
 
 import json
 import random
+import re
 import string
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -14,13 +15,55 @@ from typing import Any, Dict, List, Optional
 from database.schema_manager import SchemaManager
 from database.dynamic_crud import DynamicCRUD
 
+# First number-looking token in a string (handles "$5.00", "10 USD", "€1,234.56").
+_NUM_TOKEN = re.compile(r"[-+]?\d[\d.,]*\d|\d")
+
+
+def _parse_number(val: Any) -> Optional[float]:
+    """
+    Robustly parse a numeric value out of messy real-world input. CSV imports
+    store everything as TEXT, so prices commonly arrive as '$5.00', '1,234.56',
+    '€10', '10 USD', or European '5,99' — plain float() loses all of those.
+
+    Returns the float, or None if there's no number at all (e.g. 'free', '').
+    Handles currency symbols/units, thousands separators, and US/EU decimals.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):           # avoid True/False → 1.0/0.0 surprises
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    m = _NUM_TOKEN.search(s)
+    if not m:
+        return None
+    tok = m.group(0)
+    if "," in tok and "." in tok:
+        # Both present → the LAST separator is the decimal point.
+        if tok.rfind(",") > tok.rfind("."):
+            tok = tok.replace(".", "").replace(",", ".")   # EU: 1.234,56
+        else:
+            tok = tok.replace(",", "")                      # US: 1,234.56
+    elif "," in tok:
+        parts = tok.split(",")
+        # "5,99" → decimal comma; "1,234" / "1,234,567" → thousands separators.
+        if len(parts) == 2 and len(parts[-1]) == 2:
+            tok = tok.replace(",", ".")
+        else:
+            tok = tok.replace(",", "")
+    try:
+        return float(tok)
+    except ValueError:
+        return None
+
 
 def to_number(val: Any) -> float:
     """Parse a price-like value to float; 0.0 if blank/non-numeric (never raises)."""
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.0
+    n = _parse_number(val)
+    return n if n is not None else 0.0
 
 
 def to_stock(val: Any) -> Optional[int]:
@@ -29,12 +72,8 @@ def to_stock(val: Any) -> Optional[int]:
     trackable number (blank, text like 'plenty', etc.) so callers can treat
     that row as 'stock not tracked' instead of crashing.
     """
-    if val is None:
-        return None
-    try:
-        return int(float(val))
-    except (ValueError, TypeError):
-        return None
+    n = _parse_number(val)
+    return int(n) if n is not None else None
 
 
 class DynamicBillingSystem:

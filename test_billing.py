@@ -237,6 +237,31 @@ def _():
         assert "not found" in str(e).lower(), str(e)
 
 
+@test("to_number: parses currency-formatted prices (the 'price not showing' bug)")
+def _():
+    from billing_dynamic import to_number
+    cases = {"$5.00": 5.0, "$1,234.56": 1234.56, "€10": 10.0, "10 USD": 10.0,
+             "5,99": 5.99, "1.234,56": 1234.56, "  9.99 ": 9.99,
+             "free": 0.0, "": 0.0, None: 0.0, 14.99: 14.99}
+    for raw, exp in cases.items():
+        got = to_number(raw)
+        assert abs(got - exp) < 0.001, f"to_number({raw!r}) = {got}, expected {exp}"
+
+
+@test("create_invoice: TEXT price with '$' computes correct total (not $0)")
+def _():
+    sm, crud, uid, b = fresh()
+    # CSV imports store prices as TEXT with symbols — must still bill correctly
+    sm.create_dynamic_table(uid, "products", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "TEXT"}])
+    crud.insert_record(uid, "products", {"name": "Widget", "price": "$5.00"})
+    crud.insert_record(uid, "products", {"name": "Gadget", "price": "$12.50"})
+    inv = b.create_invoice(uid, "products",
+                           [{"item_name": "Widget", "quantity": 2},
+                            {"item_name": "Gadget", "quantity": 1}], "X")
+    assert abs(inv["total"] - 22.50) < 0.01, f"got {inv['total']} (price parsing broken)"
+
+
 @test("create_invoice: raises when no price column")
 def _():
     sm, crud, uid, b = fresh()

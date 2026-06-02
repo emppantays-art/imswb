@@ -15,6 +15,7 @@ from database.dynamic_crud import DynamicCRUD
 from ai.query_parser import ChatEngine, trim_history, DEFAULT_MODEL, MEMORY_TURNS
 from ai.rag_engine import RAGEngine
 from billing_dynamic import DynamicBillingSystem, to_number, to_stock
+from product_search import fuzzy_search
 from csv_importer import CSVImporter, VALID_TYPES as CSV_TYPES
 
 # ─── page config ─────────────────────────────────────────────────────────────
@@ -997,9 +998,28 @@ def billing_view():
 
     with left:
         st.subheader("Products")
-        products = _cached_rows(user_id, sel_table, 200)
+        all_products = _cached_rows(user_id, sel_table, 2000)
+
+        # Typo-tolerant trigram search over the product names.
+        search_q = st.text_input(
+            "🔍 Search products",
+            key="billing_search",
+            placeholder="Type a name — typo-tolerant (e.g. 'aple' finds Apple)",
+        )
+        if search_q.strip() and all_products and cols["name"]:
+            products = fuzzy_search(search_q, all_products, key=cols["name"], limit=50)
+            st.caption(f"{len(products)} match(es) for “{search_q.strip()}”")
+        else:
+            products = all_products
+            if len(products) > 50:
+                st.caption(f"Showing first 50 of {len(products)} — search to narrow down.")
+                products = products[:50]
+
         if not products:
-            st.info("No products in this table.")
+            st.info(
+                "No products in this table." if not search_q.strip()
+                else f"No products match “{search_q.strip()}”."
+            )
         else:
             for prod in products:
                 item_name  = str(prod.get(cols["name"], "?"))
