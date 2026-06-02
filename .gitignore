@@ -39,11 +39,6 @@ Thumbs.db
 data_test/
 data_test2/
 
-# ── Nexus credentials (never commit a filled-in .pypirc — only *.template) ───
-.pypirc
-nexus/.pypirc
-.netrc
-
 # ── Misc ──────────────────────────────────────────────────────────────────────
 .env
 *.db-shm
