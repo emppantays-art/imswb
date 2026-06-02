@@ -324,6 +324,19 @@ class ChatEngine:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
+                # Enforce the pinned active table. The model often anchors to a
+                # table from earlier in the conversation (via history) and picks
+                # it even after the user switches the Active-table dropdown. If a
+                # table is pinned and the model chose a DIFFERENT table that the
+                # user did NOT name in this turn's message, override it to the pin.
+                if (active_table and isinstance(args, dict)
+                        and name in ("query_data", "add_data", "update_data")):
+                    _chosen = str(args.get("table_name") or "").strip()
+                    if (_chosen and _chosen.lower() != active_table.lower()
+                            and _chosen.lower() not in user_message.lower()):
+                        args = dict(args)
+                        args["table_name"] = active_table
+
                 result = execute_tool(name, args, user_id, self.sm, self.crud,
                                      default_table=active_table, billing=self.billing)
                 all_tools.append(result)
