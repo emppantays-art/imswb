@@ -59,17 +59,20 @@ def _table_descriptions(user_id: int, sm: SchemaManager) -> str:
 
 # ── tool registry ─────────────────────────────────────────────────────────────
 
-def build_tools(user_id: int, sm: SchemaManager) -> List[Dict]:
+def build_tools(user_id: int, sm: SchemaManager, billing=None) -> List[Dict]:
     """
     Return a list of Ollama tool dicts whose descriptions reflect the user's
     current schema. Call this again after create_table / add_column so the
     LLM sees the updated schema in subsequent rounds.
+
+    Pass `billing` (a DynamicBillingSystem instance) to also include the
+    three billing tools.
     """
     table_desc = _table_descriptions(user_id, sm)
     types_enum = VALID_COLUMN_TYPES          # used in enum fields
     types_str  = ", ".join(VALID_COLUMN_TYPES)
 
-    return [
+    tools = [
         # ── query_data ──────────────────────────────────────────────────────
         {
             "type": "function",
@@ -261,6 +264,95 @@ def build_tools(user_id: int, sm: SchemaManager) -> List[Dict]:
         },
     ]
 
+    # ── billing tools (only when billing system is present) ─────────────────
+    if billing is not None:
+        billable = billing.billable_tables(user_id)
+        bill_desc = ", ".join(f"'{t}'" for t in billable) or "none yet"
+        tools += [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_invoice",
+                    "description": (
+                        "Create a sale / invoice from a product table. "
+                        f"Billable tables (have name + price columns): {bill_desc}. "
+                        "Auto-detects price and name columns. "
+                        "Reduces stock if the table has a stock column. "
+                        "Fails with a clear error if stock is insufficient."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "required": ["table_name", "items", "customer_name"],
+                        "properties": {
+                            "table_name": {
+                                "type": "string",
+                                "description": "The product/menu table to sell from.",
+                            },
+                            "items": {
+                                "type": "array",
+                                "description": "List of items to purchase.",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["item_name", "quantity"],
+                                    "properties": {
+                                        "item_name": {
+                                            "type": "string",
+                                            "description": "Name of the item exactly as stored.",
+                                        },
+                                        "quantity": {
+                                            "type": "integer",
+                                            "description": "How many units to buy.",
+                                        },
+                                    },
+                                },
+                            },
+                            "customer_name": {
+                                "type": "string",
+                                "description": "Customer's name for the receipt.",
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_daily_sales",
+                    "description": (
+                        "Get the sales summary for a specific date (or today if omitted): "
+                        "invoice count, total revenue, average ticket."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "date": {
+                                "type": "string",
+                                "description": "Date in YYYY-MM-DD format. Defaults to today.",
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "view_invoices",
+                    "description": "List recent invoices with customer, total, date, and status.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum invoices to return (default 10).",
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+    return tools
+
 
 # ── executor ──────────────────────────────────────────────────────────────────
 
@@ -330,6 +422,7 @@ def execute_tool(
     sm: SchemaManager,
     crud: DynamicCRUD,
     default_table: str = "",
+    billing=None,
 ) -> ToolResult:
     """
     Dispatch a single tool call and return a ToolResult.
@@ -493,6 +586,72 @@ def execute_tool(
                                   f"Column '{col['name']}' ({col_def['type']}) "
                                   f"added to '{table_name}'"
                               )})
+
+        # ── billing tools ────────────────────────────────────────────────────
+        if name == "create_invoice":
+            if billing is None:
+                return ToolResult(name, args, False,
+                                  {"error": "Billing system is not enabled."})
+            tbl      = args.get("table_name") or default_table
+            items    = args.get("items", [])
+            customer = args.get("customer_name", "Guest")
+            if not tbl:
+                return ToolResult(name, args, False,
+                                  {"error": "table_name is required for create_invoice."})
+            if not isinstance(items, list) or not items:
+                return ToolResult(name, args, False,
+                                  {"error": "items must be a non-empty list of {item_name, quantity}."})
+            invoice = billing.create_invoice(user_id, tbl, items, customer)
+            lines   = "\n".join(
+                f"  • {it['quantity']}x {it['item_name']} @ ${it['unit_price']:.2f} = ${it['subtotal']:.2f}"
+                for it in invoice["items"]
+            )
+            return ToolResult(name, args, True, {
+                "invoice_id":    invoice["invoice_id"],
+                "customer_name": invoice["customer_name"],
+                "total":         invoice["total"],
+                "date":          invoice["date"],
+                "items_summary": lines,
+                "message": (
+                    f"✅ INVOICE CREATED SUCCESSFULLY\n"
+                    f"Invoice ID: {invoice['invoice_id']}\n"
+                    f"Customer: {invoice['customer_name']}\n"
+                    f"Total: ${invoice['total']:.2f}\n"
+                    f"Items:\n{lines}"
+                ),
+            })
+
+        if name == "get_daily_sales":
+            if billing is None:
+                return ToolResult(name, args, False,
+                                  {"error": "Billing system is not enabled."})
+            date    = args.get("date")
+            summary = billing.get_daily_sales(user_id, date)
+            return ToolResult(name, args, True, {
+                **summary,
+                "message": (
+                    f"📊 SALES SUMMARY — {summary['date']}\n"
+                    f"Total Invoices : {summary['invoice_count']}\n"
+                    f"Total Revenue  : ${summary['total_revenue']:.2f}\n"
+                    f"Average Ticket : ${summary['average_ticket']:.2f}"
+                ),
+            })
+
+        if name == "view_invoices":
+            if billing is None:
+                return ToolResult(name, args, False,
+                                  {"error": "Billing system is not enabled."})
+            limit    = int(args.get("limit", 10))
+            invoices = billing.get_invoices(user_id, limit=limit)
+            rows     = [
+                {k: v for k, v in inv.items() if k != "items_json"}
+                for inv in invoices
+            ]
+            return ToolResult(name, args, True, {
+                "count":    len(rows),
+                "invoices": rows,
+                "message":  f"Found {len(rows)} recent invoice(s).",
+            })
 
         return ToolResult(name, args, False, {"error": f"Unknown tool: {name}"})
 

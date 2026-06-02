@@ -14,6 +14,7 @@ from database.schema_manager import VALID_COLUMN_TYPES, SchemaManager, _safe_nam
 from database.dynamic_crud import DynamicCRUD
 from ai.query_parser import ChatEngine, trim_history, DEFAULT_MODEL, MEMORY_TURNS
 from ai.rag_engine import RAGEngine
+from billing_dynamic import DynamicBillingSystem
 from csv_importer import CSVImporter, VALID_TYPES as CSV_TYPES
 
 # ─── page config ─────────────────────────────────────────────────────────────
@@ -38,12 +39,13 @@ st.markdown(
 
 @st.cache_resource
 def _init():
-    sm   = SchemaManager(base_dir="data")
-    crud = DynamicCRUD(sm)
-    rag  = RAGEngine(sm, crud)
-    return sm, crud, rag
+    sm      = SchemaManager(base_dir="data")
+    crud    = DynamicCRUD(sm)
+    rag     = RAGEngine(sm, crud)
+    billing = DynamicBillingSystem(sm, crud)
+    return sm, crud, rag, billing
 
-sm, crud, rag_engine = _init()
+sm, crud, rag_engine, billing = _init()
 csv_imp = CSVImporter(sm, crud)
 
 # ─── session state helpers ────────────────────────────────────────────────────
@@ -64,6 +66,8 @@ _ss("csv_preview",    None)   # parsed CSV waiting for user confirmation
 _ss("csv_filename",   None)   # tracks which file is loaded
 _ss("rag_enabled",    True)   # RAG context toggle for chat
 _ss("chat_table",     None)   # pinned table for AI chat context
+_ss("billing_cart",   {})     # {item_name: {quantity, unit_price}}
+_ss("last_invoice",   None)   # invoice dict shown after a completed sale
 
 
 def _queue_toast(msg: str, icon: str = "✅"):
@@ -138,13 +142,18 @@ def sidebar():
 
         st.divider()
 
-        col_dash, col_chat = st.columns(2)
+        col_dash, col_chat, col_bill = st.columns(3)
         if col_dash.button("Dashboard", use_container_width=True):
             _nav("dashboard")
             st.rerun()
         if col_chat.button("💬 Chat", use_container_width=True,
                            type="primary" if st.session_state.view == "chat" else "secondary"):
             _nav("chat")
+            st.rerun()
+        if col_bill.button("🧾 Billing", use_container_width=True,
+                           type="primary" if st.session_state.view == "billing" else "secondary"):
+            st.session_state.last_invoice = None
+            _nav("billing")
             st.rerun()
 
         col_new, col_csv = st.columns(2)
@@ -571,7 +580,7 @@ _TOOL_ICONS = {
 
 @st.cache_data(ttl=20)
 def _check_ollama(model: str):
-    return ChatEngine(sm, crud, model=model).check_ollama()
+    return ChatEngine(sm, crud, model=model, billing=billing).check_ollama()
 
 
 def _render_tool_results(tool_results: list):
@@ -723,6 +732,7 @@ def chat_view():
                     model=st.session_state.model,
                     rag=active_rag,
                     active_table=st.session_state.chat_table or "",
+                    billing=billing,
                 )
                 reply, tool_results = engine.chat(
                     user_id=user_id,
@@ -884,6 +894,157 @@ def _do_csv_import(user_id, preview, table_name, col_types, mode):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  BILLING / POS VIEW
+# ═════════════════════════════════════════════════════════════════════════════
+
+def billing_view():
+    import streamlit.components.v1 as components
+
+    user_id = st.session_state.user["id"]
+    st.title("🧾 Billing / POS")
+
+    # ── today's summary ───────────────────────────────────────────────────────
+    summary = billing.get_daily_sales(user_id)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Today's Invoices",  summary["invoice_count"])
+    m2.metric("Today's Revenue",   f"${summary['total_revenue']:.2f}")
+    m3.metric("Average Ticket",    f"${summary['average_ticket']:.2f}")
+    st.divider()
+
+    # ── receipt after a completed sale ────────────────────────────────────────
+    if st.session_state.last_invoice:
+        inv = st.session_state.last_invoice
+        st.success(
+            f"✅ Invoice **{inv['invoice_id']}** created — "
+            f"Customer: **{inv['customer_name']}** — "
+            f"Total: **${inv['total']:.2f}**"
+        )
+        with st.expander("🖨 Print Receipt", expanded=True):
+            components.html(billing.generate_receipt_html(inv), height=420, scrolling=True)
+        if st.button("➕ New Sale", type="primary"):
+            st.session_state.last_invoice = None
+            st.session_state.billing_cart  = {}
+            st.rerun()
+        st.divider()
+
+    # ── table selector ────────────────────────────────────────────────────────
+    billable = billing.billable_tables(user_id)
+    if not billable:
+        st.info(
+            "No billable tables yet. Create a table with a **name** column "
+            "(name / title / item / product / dish) and a **price** column "
+            "(price / cost / fee / rate / amount)."
+        )
+        return
+
+    sel_table = st.selectbox("Product table", billable, key="billing_sel_table")
+    cols = billing.detect_columns(user_id, sel_table)
+    hints = f"name=`{cols['name']}`, price=`{cols['price']}`"
+    if cols["stock"]:
+        hints += f", stock=`{cols['stock']}`"
+    st.caption(f"Detected columns — {hints}")
+
+    # ── products + cart ───────────────────────────────────────────────────────
+    left, right = st.columns([3, 2])
+
+    with left:
+        st.subheader("Products")
+        products = crud.query_table(user_id, sel_table, limit=200)
+        if not products:
+            st.info("No products in this table.")
+        else:
+            for prod in products:
+                item_name  = str(prod.get(cols["name"], "?"))
+                unit_price = float(prod.get(cols["price"]) or 0)
+                stock_txt  = ""
+                if cols["stock"] and prod.get(cols["stock"]) is not None:
+                    stock_txt = f"  *(stock: {int(float(prod[cols['stock']]))})*"
+                pc1, pc2, pc3 = st.columns([4, 1, 1])
+                pc1.markdown(f"**{item_name}** — ${unit_price:.2f}{stock_txt}")
+                qty_key = f"bqty_{sel_table}_{prod['id']}"
+                qty = pc2.number_input(
+                    "qty", min_value=1, value=1, step=1,
+                    key=qty_key, label_visibility="collapsed"
+                )
+                if pc3.button("＋", key=f"badd_{sel_table}_{prod['id']}"):
+                    cart = st.session_state.billing_cart
+                    if item_name in cart:
+                        cart[item_name]["quantity"] += qty
+                    else:
+                        cart[item_name] = {"quantity": qty, "unit_price": unit_price}
+                    st.rerun()
+
+    with right:
+        st.subheader("Cart")
+        cart = st.session_state.billing_cart
+
+        if not cart:
+            st.info("Cart is empty — add items from the left.")
+        else:
+            cart_total = 0.0
+            for item_name, info in list(cart.items()):
+                subtotal   = info["quantity"] * info["unit_price"]
+                cart_total += subtotal
+                rc1, rc2   = st.columns([5, 1])
+                rc1.markdown(
+                    f"{info['quantity']}× **{item_name}** "
+                    f"@ ${info['unit_price']:.2f} = **${subtotal:.2f}**"
+                )
+                if rc2.button("✕", key=f"brm_{item_name}"):
+                    del cart[item_name]
+                    st.rerun()
+
+            st.markdown(f"### Total: ${cart_total:.2f}")
+            st.divider()
+
+            customer = st.text_input("Customer name", key="billing_customer")
+            bc1, bc2 = st.columns(2)
+            if bc1.button("🗑 Clear", use_container_width=True):
+                st.session_state.billing_cart = {}
+                st.rerun()
+            if bc2.button("✅ Complete Sale", type="primary", use_container_width=True):
+                if not customer.strip():
+                    st.error("Enter a customer name.")
+                else:
+                    items_list = [
+                        {"item_name": k, "quantity": v["quantity"]}
+                        for k, v in cart.items()
+                    ]
+                    try:
+                        invoice = billing.create_invoice(
+                            user_id, sel_table, items_list, customer.strip()
+                        )
+                        st.session_state.billing_cart  = {}
+                        st.session_state.last_invoice  = invoice
+                        _queue_toast(
+                            f"Invoice {invoice['invoice_id']} — ${invoice['total']:.2f}",
+                            icon="🧾"
+                        )
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+    # ── recent invoices ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Recent Invoices")
+    invoices = billing.get_invoices(user_id, limit=15)
+    if invoices:
+        df_rows = []
+        for inv in invoices:
+            df_rows.append({
+                "Invoice ID":   inv.get("invoice_id", ""),
+                "Customer":     inv.get("customer_name", ""),
+                "Table":        inv.get("source_table", ""),
+                "Total":        f"${float(inv.get('total', 0)):.2f}",
+                "Date":         inv.get("date", ""),
+                "Status":       inv.get("status", ""),
+            })
+        st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No invoices yet.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -911,6 +1072,8 @@ def main():
     view = st.session_state.view
     if view == "chat":
         chat_view()
+    elif view == "billing":
+        billing_view()
     elif view == "import_csv":
         import_csv_view()
     elif view == "create_table":

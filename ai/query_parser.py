@@ -30,7 +30,8 @@ MAX_TOOL_ROUNDS = 8   # caps multi-step chains (e.g. query-then-update)
 MEMORY_TURNS = 5      # user+assistant pairs kept in context
 
 
-def _system_prompt(user_id: int, sm: SchemaManager, rag_context: str = "", active_table: str = "") -> str:
+def _system_prompt(user_id: int, sm: SchemaManager, rag_context: str = "",
+                   active_table: str = "", billing=None) -> str:
     schema      = schema_summary(user_id, sm)
     table_names = [t["table_name"] for t in sm.get_user_tables(user_id)]
     table_list  = ", ".join(table_names) if table_names else "none"
@@ -58,6 +59,17 @@ def _system_prompt(user_id: int, sm: SchemaManager, rag_context: str = "", activ
         if active_table else ""
     )
 
+    billing_section = ""
+    if billing is not None:
+        billable = billing.billable_tables(user_id)
+        if billable:
+            billing_section = (
+                "\nBILLING TOOLS AVAILABLE: create_invoice, get_daily_sales, view_invoices.\n"
+                f"Billable tables (name + price columns detected): {', '.join(billable)}.\n"
+                "Use create_invoice to sell items. Use get_daily_sales for revenue summary. "
+                "Use view_invoices to list past sales.\n"
+            )
+
     return f"""\
 You are a database assistant. You may ONLY use data from tool results. Never invent values.
 {active_section}
@@ -68,7 +80,7 @@ Columns by table (use to choose table_name):
 {col_map}
 
 Valid tables: {table_list}
-{rag_section}
+{rag_section}{billing_section}
 Rules:
 1. TABLE CHECK — run before calling any tool:
    Valid table NAMES (not values) are: {table_list}
@@ -110,12 +122,14 @@ class ChatEngine:
         model: str = DEFAULT_MODEL,
         rag: Optional["RAGEngine"] = None,
         active_table: str = "",
+        billing=None,
     ):
         self.sm           = sm
         self.crud         = crud
         self.model        = model
         self.rag          = rag
         self.active_table = active_table
+        self.billing      = billing
 
     # ── health ────────────────────────────────────────────────────────────────
 
@@ -163,8 +177,9 @@ class ChatEngine:
                 rag_context = "\n".join(f"  • {s}" for s in snippets)
 
         active_table = self.active_table
-        system    = _system_prompt(user_id, self.sm, rag_context=rag_context, active_table=active_table)
-        tools     = build_tools(user_id, self.sm)
+        system    = _system_prompt(user_id, self.sm, rag_context=rag_context,
+                                   active_table=active_table, billing=self.billing)
+        tools     = build_tools(user_id, self.sm, billing=self.billing)
         all_tools: List[ToolResult] = []
         _update_nudge_sent = False
         _in_update_flow = False   # True after retryable update_data failure → suppress post-query nudge
@@ -294,7 +309,8 @@ class ChatEngine:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
-                result = execute_tool(name, args, user_id, self.sm, self.crud, default_table=active_table)
+                result = execute_tool(name, args, user_id, self.sm, self.crud,
+                                     default_table=active_table, billing=self.billing)
                 all_tools.append(result)
 
                 messages.append({
@@ -503,7 +519,7 @@ class ChatEngine:
                 return f"No records found in '{_tbl}'.", all_tools
 
             # Rebuild: schema may have changed if create_table / add_column ran
-            tools = build_tools(user_id, self.sm)
+            tools = build_tools(user_id, self.sm, billing=self.billing)
 
         # ── exceeded max rounds ───────────────────────────────────────────────
         messages.append({
