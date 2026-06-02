@@ -66,11 +66,17 @@ def _cached_count(user_id: int, table_name: str):
 def _cached_schema(user_id: int, table_name: str):
     return sm.get_table_schema(user_id, table_name)
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_rows(user_id: int, table_name: str, limit: int = 500):
+    """Full row set for a table — re-queried on every rerun without this cache."""
+    return crud.query_table(user_id, table_name, limit=limit)
+
 def _invalidate_caches():
-    """Clear cached metadata after any write so the UI reflects changes at once."""
+    """Clear cached metadata + rows after any write so the UI reflects changes at once."""
     _cached_tables.clear()
     _cached_count.clear()
     _cached_schema.clear()
+    _cached_rows.clear()
 
 # ─── session state helpers ────────────────────────────────────────────────────
 
@@ -352,11 +358,12 @@ def table_view():
 # ── Data tab ──────────────────────────────────────────────────────────────────
 
 def _tab_data(user_id, table_name, schema):
-    records = crud.query_table(user_id, table_name)
+    records = _cached_rows(user_id, table_name)
 
     hdr, btn_refresh, btn_export, btn_index = st.columns([3, 1, 1, 1])
     hdr.caption(f"{len(records)} records")
     if btn_refresh.button("↻ Refresh", key="btn_refresh"):
+        _cached_rows.clear()   # force a fresh read on explicit refresh
         st.rerun()
 
     if btn_index.button("🔍 Re-index", key="btn_reindex",
@@ -990,7 +997,7 @@ def billing_view():
 
     with left:
         st.subheader("Products")
-        products = crud.query_table(user_id, sel_table, limit=200)
+        products = _cached_rows(user_id, sel_table, 200)
         if not products:
             st.info("No products in this table.")
         else:
