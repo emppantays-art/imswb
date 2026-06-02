@@ -531,6 +531,12 @@ def execute_tool(
                         args = dict(args)
                         args["table_name"] = table
             data   = args.get("data", {})
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)   # model often sends a JSON string
+                    args = dict(args); args["data"] = data   # keep ToolResult consistent
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if not isinstance(data, dict):
                 cols = [c["column_name"]
                         for c in (sm.get_table_schema(user_id, table) or [])]
@@ -540,7 +546,15 @@ def execute_tool(
                     f"e.g. {json.dumps(example)}. "
                     f"Available columns: {', '.join(cols)}."
                 )}, retryable=True)
-            new_id = crud.insert_record(user_id, table, data)
+            try:
+                new_id = crud.insert_record(user_id, table, data)
+            except ValueError as exc:
+                cols = [c["column_name"]
+                        for c in (sm.get_table_schema(user_id, table) or [])]
+                return ToolResult(name, args, False, {"error": (
+                    f"{exc} Provide the data using exactly these column names: "
+                    f"{', '.join(cols)}."
+                )}, retryable=True)
             return ToolResult(name, args, True,
                               {"inserted_id": new_id,
                                "message": f"Inserted record id={new_id}"})
@@ -573,6 +587,12 @@ def execute_tool(
                     "Search for the record first using query_data, then pass its numeric id here."
                 )}, retryable=True)
             updates   = args.get("updates", {})
+            if isinstance(updates, str):
+                try:
+                    updates = json.loads(updates)   # model often sends a JSON string
+                    args = dict(args); args["updates"] = updates   # keep ToolResult consistent
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if not isinstance(updates, dict):
                 cols = [c["column_name"]
                         for c in (sm.get_table_schema(user_id, table) or [])]

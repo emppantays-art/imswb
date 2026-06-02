@@ -25,6 +25,14 @@ class DynamicCRUD:
         schema = self.sm.get_table_schema(user_id, table_name) or []
         valid = {c["column_name"] for c in schema}
         row = {k: v for k, v in data.items() if k in valid}
+        # Caller passed data but NONE of the keys match real columns — reject it.
+        # Without this, the empty-data DEFAULT VALUES path below would silently
+        # insert a blank row and report success, losing the caller's data.
+        if data and not row:
+            raise ValueError(
+                "None of the provided fields match this table's columns. "
+                f"Valid columns: {', '.join(sorted(valid))}."
+            )
         for col in schema:
             if col["is_required"] and col.get("default_value") is None and col["column_name"] not in row:
                 raise ValueError(f"Column '{col['column_name']}' is required")
