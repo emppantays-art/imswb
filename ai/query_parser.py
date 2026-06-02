@@ -472,26 +472,38 @@ class ChatEngine:
                 )
                 _simple2 = [
                     {"role": "system", "content": (
-                        "You are a database assistant. Answer the user's question using ONLY "
-                        "the rows listed below. Do NOT call any tools. Do NOT say you will "
-                        "call a tool. Never invent data. Reply in plain text only.\n"
-                        "For max/min/most/least/highest/lowest questions: compare the numeric "
-                        "values in the rows carefully and identify the correct row. "
-                        "Do not guess — read each value."
+                        "You are a database assistant writing the FINAL answer to the user. "
+                        "You have NO tools — never emit JSON, tool calls, function names, or "
+                        "phrases like 'I will call'. Answer directly in plain English using ONLY "
+                        "the rows provided. Never invent data.\n"
+                        "For max/min/most/least/highest/lowest: compare the numeric values and "
+                        "name the correct row. Read each value; do not guess."
                     )},
                     {"role": "user", "content": (
                         f"Database rows ({_n} total):\n{_rows_text}\n\n"
                         f"Question: {user_message}\n\n"
-                        "Answer in one or two sentences using only the data above. "
+                        "Write the final answer in one or two plain sentences using only the data above. "
                         "If counting total rows: give ONE total number — do not break down by category. "
-                        "If filtering by a condition: count only matching rows and state the number. "
-                        "If finding a max or min value: scan every row and name the one with the highest/lowest number."
+                        "If filtering by a condition: count only matching rows and state the number "
+                        "(say 'no records' / '0' when none match). "
+                        "If finding a max or min value: scan every row and name the one with the "
+                        "highest/lowest number.\nAnswer:"
                     )},
                 ]
-                _confirm2 = ollama.chat(model=self.model, messages=_simple2)
-                _text2 = _clean_reply(_confirm2.message.content or "")
-                if not _text2:
-                    # Model failed to produce usable text — list the rows directly
+                _confirm2 = ollama.chat(
+                    model=self.model, messages=_simple2,
+                    options={"temperature": 0},
+                )
+                _raw2  = _confirm2.message.content or ""
+                _text2 = _clean_reply(_raw2)
+                # Detect tool-call leakage the cleaner may not fully remove, or a reply
+                # that became a non-answer after stripping.
+                _leaked = bool(re.search(
+                    r'"name"\s*:\s*"|"parameters"\s*:|I will call \w|\bquery_data\s*[\(\{]',
+                    _raw2, re.IGNORECASE,
+                ))
+                if not _text2 or _leaked:
+                    # Model failed to produce a clean answer — list the rows directly
                     _row_summaries = "; ".join(
                         ", ".join(f"{_k}={_v}" for _k, _v in _r.items() if _k != "id")
                         for _r in _d[:5]
@@ -566,12 +578,16 @@ def _clean_reply(text: str) -> str:
                   '', text, flags=re.IGNORECASE)
     text = re.sub(r"I\s+will\s+(?:now\s+)?call\s+.*?tool.*?[\.\!\n]?",
                   '', text, flags=re.IGNORECASE)
+    # "I will call query_data to get more information" (no 'tool' keyword, uses tool name directly)
+    text = re.sub(r"\bI\s+will\s+call\s+\w+\b.*?[\.\!\n]", '', text, flags=re.IGNORECASE)
     text = re.sub(r"Let\s+me\s+(?:call|use|run|check)\s+(?:the\s+)?(?:correct\s+)?tool.*?[\.\!\n]?",
                   '', text, flags=re.IGNORECASE)
     # "Fix this by calling..." leaked from ARGUMENT ERROR messages
     text = re.sub(r"Fix\s+this\s+by\s+calling.*?[\.\!\n]?", '', text, flags=re.IGNORECASE)
     # "Do NOT tell the user" leaked from retryable error content
     text = re.sub(r"Do\s+NOT\s+tell\s+the\s+user.*?[\.\!\n]?", '', text, flags=re.IGNORECASE)
+    # Bare JSON fragment without leading {: "name": "query_data", "parameters": ...
+    text = re.sub(r'"name"\s*:\s*"[^"]+"\s*,.*', '', text, flags=re.DOTALL)
     return text.strip()
 
 
