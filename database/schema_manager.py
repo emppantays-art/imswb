@@ -12,6 +12,9 @@ from typing import Dict, List, Optional
 
 VALID_COLUMN_TYPES = ["TEXT", "INTEGER", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP"]
 
+# Names that the DDL generator adds automatically — user columns must not collide.
+_RESERVED_COLS = {"id", "created_at", "updated_at"}
+
 _SQL_TYPE = {
     "TEXT": "TEXT",
     "INTEGER": "INTEGER",
@@ -62,6 +65,11 @@ def _safe_name(name: str) -> str:
     return s[:64]
 
 
+def _escape_sql_str(val: str) -> str:
+    """Escape a value for embedding in a SQL string literal (doubles any single quotes)."""
+    return val.replace("'", "''")
+
+
 class SchemaManager:
     def __init__(self, base_dir: str = "data"):
         self.base_dir = Path(base_dir)
@@ -91,6 +99,7 @@ class SchemaManager:
         path = str(self.base_dir / "users" / f"{user_id}.db")
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -112,6 +121,18 @@ class SchemaManager:
     def _bootstrap(self):
         with self._meta_db() as conn:
             conn.executescript(_METADATA_DDL)
+        with self._meta_db() as conn:
+            try:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_col "
+                    "ON custom_columns(table_id, column_name)"
+                )
+            except sqlite3.OperationalError:
+                pass  # existing duplicate data; app-level check still prevents new ones
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cc_pos "
+                "ON custom_columns(table_id, position)"
+            )
 
     # ── passwords ───────────────────────────────────────────────────────────
 
@@ -190,8 +211,14 @@ class SchemaManager:
             ctype = col["type"].upper()
             if ctype not in VALID_COLUMN_TYPES:
                 raise ValueError(f"Invalid column type: {col['type']}")
+            safe = _safe_name(col["name"])
+            if safe in _RESERVED_COLS:
+                raise ValueError(
+                    f"Column name '{col['name']}' is reserved (id, created_at, updated_at "
+                    "are added automatically)"
+                )
             sanitized.append({
-                "name": _safe_name(col["name"]),
+                "name": safe,
                 "type": ctype,
                 "required": bool(col.get("required")),
                 "default": col.get("default") or None,
@@ -202,7 +229,7 @@ class SchemaManager:
         for col in sanitized:
             sql_t = _SQL_TYPE[col["type"]]
             nn = " NOT NULL" if col["required"] else ""
-            df = f" DEFAULT '{col['default']}'" if col["default"] is not None else ""
+            df = f" DEFAULT '{_escape_sql_str(col['default'])}'" if col["default"] is not None else ""
             col_defs.append(f'"{col["name"]}" {sql_t}{nn}{df}')
         col_defs += [
             "created_at TEXT DEFAULT (datetime('now'))",
@@ -230,8 +257,13 @@ class SchemaManager:
         except sqlite3.IntegrityError:
             raise ValueError(f"Table '{table_name}' already exists for this user")
 
-        with self._user_db(user_id) as conn:
-            conn.execute(ddl)
+        try:
+            with self._user_db(user_id) as conn:
+                conn.execute(ddl)
+        except Exception:
+            with self._meta_db() as conn:
+                conn.execute("DELETE FROM custom_tables WHERE id=?", (table_id,))
+            raise
 
         return table_id
 
@@ -248,10 +280,16 @@ class SchemaManager:
         """
         table_name = _safe_name(table_name)
         col_name = _safe_name(column_def["name"])
+        if col_name in _RESERVED_COLS:
+            raise ValueError(
+                f"Column name '{column_def['name']}' is reserved (id, created_at, updated_at "
+                "are added automatically)"
+            )
         col_type = column_def["type"].upper()
         if col_type not in VALID_COLUMN_TYPES:
             raise ValueError(f"Invalid column type: {col_type}")
 
+        col_id = None
         with self._meta_db() as conn:
             t_row = conn.execute(
                 "SELECT id FROM custom_tables WHERE user_id=? AND table_name=?",
@@ -272,7 +310,7 @@ class SchemaManager:
                 (table_id,),
             ).fetchone()[0]
 
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO custom_columns
                    (table_id, column_name, column_type, is_required, default_value, position)
                    VALUES (?,?,?,?,?,?)""",
@@ -283,14 +321,20 @@ class SchemaManager:
                     max_pos + 1,
                 ),
             )
+            col_id = cur.lastrowid
 
         default = column_def.get("default")
-        df_clause = f" DEFAULT '{default}'" if default else ""
-        with self._user_db(user_id) as conn:
-            conn.execute(
-                f'ALTER TABLE "{table_name}" ADD COLUMN "{col_name}" '
-                f'{_SQL_TYPE[col_type]}{df_clause}'
-            )
+        df_clause = f" DEFAULT '{_escape_sql_str(default)}'" if default else ""
+        try:
+            with self._user_db(user_id) as conn:
+                conn.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{col_name}" '
+                    f'{_SQL_TYPE[col_type]}{df_clause}'
+                )
+        except Exception:
+            with self._meta_db() as conn:
+                conn.execute("DELETE FROM custom_columns WHERE id=?", (col_id,))
+            raise
 
     def drop_table(self, user_id: int, table_name: str) -> None:
         table_name = _safe_name(table_name)
@@ -301,10 +345,13 @@ class SchemaManager:
             ).fetchone()
             if not t_row:
                 raise ValueError(f"Table '{table_name}' not found")
-            # cascade deletes custom_columns too via FK
-            conn.execute("DELETE FROM custom_tables WHERE id=?", (t_row["id"],))
+        table_id = t_row["id"]
+        # Drop actual table first; if this fails, metadata is unchanged.
         with self._user_db(user_id) as conn:
             conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        # cascade deletes custom_columns too via FK
+        with self._meta_db() as conn:
+            conn.execute("DELETE FROM custom_tables WHERE id=?", (table_id,))
 
     # ── read-only schema queries ─────────────────────────────────────────────
 

@@ -22,19 +22,24 @@ class DynamicCRUD:
     ) -> int:
         """Insert a row. Returns the new row's id."""
         self._assert_access(user_id, table_name)
-        valid = self._valid_cols(user_id, table_name)
+        schema = self.sm.get_table_schema(user_id, table_name) or []
+        valid = {c["column_name"] for c in schema}
         row = {k: v for k, v in data.items() if k in valid}
-        if not row:
-            raise ValueError("No valid column data provided")
-
-        cols = list(row)
-        quoted = ", ".join(f'"{c}"' for c in cols)
-        placeholders = ", ".join("?" * len(cols))
-        sql = f'INSERT INTO "{table_name}" ({quoted}) VALUES ({placeholders})'
+        for col in schema:
+            if col["is_required"] and col.get("default_value") is None and col["column_name"] not in row:
+                raise ValueError(f"Column '{col['column_name']}' is required")
 
         conn = self.sm._open_user_db(user_id)
         try:
-            cur = conn.execute(sql, [row[c] for c in cols])
+            if row:
+                cols = list(row)
+                quoted = ", ".join(f'"{c}"' for c in cols)
+                placeholders = ", ".join("?" * len(cols))
+                sql = f'INSERT INTO "{table_name}" ({quoted}) VALUES ({placeholders})'
+                cur = conn.execute(sql, [row[c] for c in cols])
+            else:
+                # All columns have DB-level defaults; use DEFAULT VALUES.
+                cur = conn.execute(f'INSERT INTO "{table_name}" DEFAULT VALUES')
             conn.commit()
             return cur.lastrowid
         except Exception:
@@ -114,7 +119,8 @@ class DynamicCRUD:
         if filters:
             clauses = []
             for k, v in filters.items():
-                if k in valid:
+                # Skip non-primitive values (dicts, lists) — only exact-match scalars work
+                if k in valid and isinstance(v, (str, int, float, bool, type(None))):
                     clauses.append(f'"{k}" = ?')
                     params.append(v)
             if clauses:
@@ -152,8 +158,7 @@ class DynamicCRUD:
             conn.close()
 
     def count_records(self, user_id: int, table_name: str) -> int:
-        if not self.sm.verify_user_owns_table(user_id, table_name):
-            return 0
+        self._assert_access(user_id, table_name)
         conn = self.sm._open_user_db(user_id)
         try:
             return conn.execute(
@@ -161,6 +166,41 @@ class DynamicCRUD:
             ).fetchone()[0]
         finally:
             conn.close()
+
+    def bulk_insert_records(
+        self,
+        user_id: int,
+        table_name: str,
+        records: List[Dict[str, Any]],
+    ) -> int:
+        """
+        Insert many rows in a single DB transaction. Returns count inserted.
+        Much faster than calling insert_record() in a loop for large CSV imports.
+        """
+        self._assert_access(user_id, table_name)
+        valid = self._valid_cols(user_id, table_name)
+        conn = self.sm._open_user_db(user_id)
+        count = 0
+        try:
+            for data in records:
+                row = {k: v for k, v in data.items() if k in valid}
+                if not row:
+                    continue
+                cols = list(row)
+                quoted = ", ".join(f'"{c}"' for c in cols)
+                placeholders = ", ".join("?" * len(cols))
+                conn.execute(
+                    f'INSERT INTO "{table_name}" ({quoted}) VALUES ({placeholders})',
+                    [row[c] for c in cols],
+                )
+                count += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return count
 
     def search_table(
         self,

@@ -10,7 +10,7 @@ what exists without needing a separate schema-lookup tool.
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from database.schema_manager import SchemaManager, VALID_COLUMN_TYPES
 from database.dynamic_crud import DynamicCRUD
@@ -78,10 +78,12 @@ def build_tools(user_id: int, sm: SchemaManager) -> List[Dict]:
                 "description": (
                     f"Fetch rows from a table (max {QUERY_LIMIT} rows). "
                     f"Available tables: {table_desc}. "
+                    "Infer table_name from context: if the user mentions a column "
+                    "name (e.g. 'price', 'author'), use the table that has that column. "
                     "Pass 'filters' as column:value pairs for exact equality. "
                     "Omit 'filters' to return all rows. "
-                    "For comparisons or ranges (e.g. price < 20), fetch all rows "
-                    "and note which ones satisfy the condition in your reply."
+                    "For comparisons or ranges (e.g. price < 20), fetch ALL rows "
+                    "then filter in your reply."
                 ),
                 "parameters": {
                     "type": "object",
@@ -143,8 +145,9 @@ def build_tools(user_id: int, sm: SchemaManager) -> List[Dict]:
                 "description": (
                     "Update columns of an existing record identified by its integer id. "
                     f"Available tables: {table_desc}. "
-                    "IMPORTANT: if you do not know the record's id, call query_data "
-                    "first to retrieve it, then call update_data."
+                    "ALWAYS call query_data first to find the record and get its id. "
+                    "NEVER guess or assume an id — only use an id returned by a "
+                    "prior query_data call in this conversation."
                 ),
                 "parameters": {
                     "type": "object",
@@ -266,24 +269,57 @@ class ToolResult:
     name: str
     args: Dict[str, Any]
     success: bool
-    payload: Any   # JSON-serialisable
+    payload: Any        # JSON-serialisable
+    retryable: bool = False  # True → model should fix args and retry; False → report to user
 
     def content_str(self) -> str:
         """What the LLM sees in the tool-role message."""
         if not self.success:
             err = self.payload.get("error", "unknown error")
-            # Plain English — small models misread JSON-formatted errors as query results
+
+            if self.retryable:
+                return (
+                    f"ARGUMENT ERROR: {err}\n"
+                    "Do NOT tell the user. Fix this by calling the correct tool NOW."
+                )
+
+            # Table-not-found: give the model a scripted reply to copy verbatim
+            table = self.args.get("table_name", "?")
+            if "does not exist for this user" in err or "not found" in err.lower():
+                scripted = (
+                    f"STOP → The '{table}' table doesn't exist yet. "
+                    "Would you like me to create it?"
+                )
+                return scripted
+
+            # Record-not-found on update: scripted to avoid "No records found" conflation
+            if "No record with id=" in err:
+                scripted = f"STOP → Error: {err}. The update was not applied."
+                return scripted
+
+            # Generic failure
             return (
                 f"TOOL FAILED: {err}\n"
-                "Tell the user about this error word-for-word. "
-                "Do NOT say 'no records found'. Do NOT pretend the operation succeeded."
+                "STOP calling tools. Reply: \"Error: " + err + "\""
             )
-        # For query_data, send only the lean payload (no timestamps)
+
+        # Successful query_data — lean payload only (timestamps excluded)
         if self.name == "query_data":
             return json.dumps({
                 "count": self.payload["count"],
                 "data":  self.payload["data"],
             }, default=str)
+
+        # Successful update_data — include what changed so the model can confirm it
+        if self.name == "update_data":
+            updates = self.args.get("updates", {})
+            changes = ", ".join(f"{k}={v}" for k, v in updates.items())
+            return json.dumps({
+                "result": "success",
+                "updated_id": self.payload["updated_id"],
+                "changes_applied": changes,
+            }, default=str)
+
         return json.dumps(self.payload, default=str)
 
 
@@ -293,15 +329,43 @@ def execute_tool(
     user_id: int,
     sm: SchemaManager,
     crud: DynamicCRUD,
+    default_table: str = "",
 ) -> ToolResult:
     """
     Dispatch a single tool call and return a ToolResult.
     Never raises — errors are captured in the result payload.
     """
+    # Normalize table_name — small models sometimes capitalize (e.g. "Books" vs "books")
+    if isinstance(args, dict) and isinstance(args.get("table_name"), str):
+        args = dict(args)
+        args["table_name"] = args["table_name"].strip().lower()
     try:
         if name == "query_data":
-            table   = args["table_name"]
+            table = args.get("table_name") or ""
+            if not table:
+                if default_table:
+                    table = default_table
+                    args = dict(args)
+                    args["table_name"] = table
+                else:
+                    _all_tables = sm.get_user_tables(user_id)
+                    if len(_all_tables) == 1:
+                        table = _all_tables[0]["table_name"]
+                        args = dict(args)
+                        args["table_name"] = table
+                    else:
+                        available = ", ".join(t["table_name"] for t in _all_tables) or "none"
+                        first = available.split(",")[0].strip() if available != "none" else "table"
+                        return ToolResult(name, args, False, {"error": (
+                            f"table_name is required as a top-level parameter. "
+                            f"Example: {{\"table_name\": \"{first}\", \"filters\": {{}}}}. "
+                            f"Available tables: {available}."
+                        )}, retryable=True)
+
             filters = args.get("filters") or None
+            # Guard: filters must be a dict, not a bare string
+            if filters is not None and not isinstance(filters, dict):
+                filters = None
             rows    = crud.query_table(user_id, table,
                                        filters=filters, limit=QUERY_LIMIT)
             # Strip timestamp noise so the model gets a smaller, cleaner payload
@@ -312,18 +376,83 @@ def execute_tool(
             return ToolResult(name, args, True, payload)
 
         if name == "add_data":
-            table  = args["table_name"]
-            data   = args["data"]
+            table  = args.get("table_name") or ""
+            if not table:
+                if default_table:
+                    table = default_table
+                    args = dict(args)
+                    args["table_name"] = table
+                else:
+                    _all_tables = sm.get_user_tables(user_id)
+                    if len(_all_tables) == 1:
+                        table = _all_tables[0]["table_name"]
+                        args = dict(args)
+                        args["table_name"] = table
+            data   = args.get("data", {})
+            if not isinstance(data, dict):
+                cols = [c["column_name"]
+                        for c in (sm.get_table_schema(user_id, table) or [])]
+                example = {c: "..." for c in cols[:3]}
+                return ToolResult(name, args, False, {"error": (
+                    f"'data' must be a JSON object of column:value pairs, "
+                    f"e.g. {json.dumps(example)}. "
+                    f"Available columns: {', '.join(cols)}."
+                )}, retryable=True)
             new_id = crud.insert_record(user_id, table, data)
             return ToolResult(name, args, True,
                               {"inserted_id": new_id,
                                "message": f"Inserted record id={new_id}"})
 
         if name == "update_data":
-            table     = args["table_name"]
-            record_id = int(args["record_id"])
-            updates   = args["updates"]
-            changed   = crud.update_record(user_id, table, record_id, updates)
+            table  = args.get("table_name") or ""
+            if not table:
+                if default_table:
+                    table = default_table
+                    args = dict(args)
+                    args["table_name"] = table
+                else:
+                    _all_tables = sm.get_user_tables(user_id)
+                    if len(_all_tables) == 1:
+                        table = _all_tables[0]["table_name"]
+                        args = dict(args)
+                        args["table_name"] = table
+            raw_id = args.get("record_id")
+            if raw_id is None or str(raw_id).strip() == "":
+                return ToolResult(name, args, False, {"error": (
+                    "record_id is missing or empty. You MUST call query_data first "
+                    "to locate the record and obtain its integer id. Then call "
+                    "update_data with that id."
+                )}, retryable=True)
+            try:
+                record_id = int(raw_id)
+            except (ValueError, TypeError):
+                return ToolResult(name, args, False, {"error": (
+                    f"record_id must be an integer, got {raw_id!r}. "
+                    "Search for the record first using query_data, then pass its numeric id here."
+                )}, retryable=True)
+            updates   = args.get("updates", {})
+            if not isinstance(updates, dict):
+                cols = [c["column_name"]
+                        for c in (sm.get_table_schema(user_id, table) or [])]
+                return ToolResult(name, args, False, {"error": (
+                    f"'updates' must be a JSON object of column:value pairs, "
+                    f"e.g. {{\"quantity\": 5}}. "
+                    f"Available columns: {', '.join(cols)}."
+                )}, retryable=True)
+            try:
+                changed = crud.update_record(user_id, table, record_id, updates)
+            except ValueError as exc:
+                err_str = str(exc)
+                if "No valid columns" in err_str:
+                    valid_cols = ", ".join(sorted(
+                        c["column_name"]
+                        for c in (sm.get_table_schema(user_id, table) or [])
+                    ))
+                    return ToolResult(name, args, False, {"error": (
+                        f"{err_str}. Valid column names for '{table}': {valid_cols}. "
+                        "Use one of those exact names in your updates dict."
+                    )}, retryable=True)
+                raise
             if changed:
                 return ToolResult(name, args, True,
                                   {"updated_id": record_id,

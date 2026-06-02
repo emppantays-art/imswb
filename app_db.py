@@ -5,14 +5,16 @@ Run:  streamlit run app_db.py
 """
 
 import json
+from typing import Dict
 import pandas as pd
 import streamlit as st
-from datetime import date, datetime
+from datetime import date
 
-from database.schema_manager import VALID_COLUMN_TYPES, SchemaManager
+from database.schema_manager import VALID_COLUMN_TYPES, SchemaManager, _safe_name
 from database.dynamic_crud import DynamicCRUD
 from ai.query_parser import ChatEngine, trim_history, DEFAULT_MODEL, MEMORY_TURNS
-from ai.dynamic_tools import schema_summary, ToolResult
+from ai.rag_engine import RAGEngine
+from csv_importer import CSVImporter, VALID_TYPES as CSV_TYPES
 
 # ─── page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -36,10 +38,13 @@ st.markdown(
 
 @st.cache_resource
 def _init():
-    sm = SchemaManager(base_dir="data")
-    return sm, DynamicCRUD(sm)
+    sm   = SchemaManager(base_dir="data")
+    crud = DynamicCRUD(sm)
+    rag  = RAGEngine(sm, crud)
+    return sm, crud, rag
 
-sm, crud = _init()
+sm, crud, rag_engine = _init()
+csv_imp = CSVImporter(sm, crud)
 
 # ─── session state helpers ────────────────────────────────────────────────────
 
@@ -55,6 +60,10 @@ _ss("_toast", None)        # survives rerun; flushed once at top of each render
 _ss("chat_messages", [])   # display history for the chat view
 _ss("llm_history", [])     # trimmed LLM context
 _ss("model", DEFAULT_MODEL)
+_ss("csv_preview",    None)   # parsed CSV waiting for user confirmation
+_ss("csv_filename",   None)   # tracks which file is loaded
+_ss("rag_enabled",    True)   # RAG context toggle for chat
+_ss("chat_table",     None)   # pinned table for AI chat context
 
 
 def _queue_toast(msg: str, icon: str = "✅"):
@@ -138,13 +147,18 @@ def sidebar():
             _nav("chat")
             st.rerun()
 
-        if st.button("＋ New Table", use_container_width=True, type="primary"):
-            # clear any leftover column-builder keys
+        col_new, col_csv = st.columns(2)
+        if col_new.button("＋ New Table", use_container_width=True, type="primary"):
             for i in range(st.session_state.num_new_cols):
                 for p in ("cn_", "ct_", "cr_", "cd_"):
                     st.session_state.pop(f"{p}{i}", None)
             st.session_state.num_new_cols = 1
             _nav("create_table")
+            st.rerun()
+        if col_csv.button("📁 CSV", use_container_width=True):
+            st.session_state.csv_preview  = None
+            st.session_state.csv_filename = None
+            _nav("import_csv")
             st.rerun()
 
         st.divider()
@@ -273,7 +287,7 @@ def _do_create_table(user_id: int, table_name: str, num: int):
             for p in ("cn_", "ct_", "cr_", "cd_"):
                 st.session_state.pop(f"{p}{i}", None)
         st.session_state.num_new_cols = 1
-        _nav("table", table_name)
+        _nav("table", _safe_name(table_name))
         st.rerun()
     except ValueError as e:
         st.error(str(e))
@@ -306,10 +320,16 @@ def table_view():
 def _tab_data(user_id, table_name, schema):
     records = crud.query_table(user_id, table_name)
 
-    hdr, btn = st.columns([4, 1])
+    hdr, btn_refresh, btn_export, btn_index = st.columns([3, 1, 1, 1])
     hdr.caption(f"{len(records)} records")
-    if btn.button("↻ Refresh", key="btn_refresh"):
+    if btn_refresh.button("↻ Refresh", key="btn_refresh"):
         st.rerun()
+
+    if btn_index.button("🔍 Re-index", key="btn_reindex",
+                        help="Update RAG search index for this table"):
+        with st.spinner("Indexing…"):
+            n = rag_engine.index_table(user_id, table_name)
+        st.toast(f"Indexed {n} rows from '{table_name}'", icon="🔍")
 
     if not records:
         st.info("No records yet — use the **Insert** tab to add data.")
@@ -317,6 +337,14 @@ def _tab_data(user_id, table_name, schema):
 
     df = pd.DataFrame(records)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    btn_export.download_button(
+        "⬇ CSV",
+        data=df.to_csv(index=False),
+        file_name=f"{table_name}.csv",
+        mime="text/csv",
+        key="btn_export_csv",
+    )
 
     st.divider()
     st.markdown("#### Edit / Delete a Record")
@@ -478,6 +506,7 @@ def _tab_danger(user_id, table_name):
     if st.button("Drop Table", type="primary", key="btn_drop"):
         if confirm.strip() == table_name:
             sm.drop_table(user_id, table_name)
+            rag_engine.remove_table(user_id, table_name)
             _queue_toast(f"Table '{table_name}' dropped", icon="🗑️")
             st.session_state.update(view="dashboard", active_table=None)
             st.rerun()
@@ -508,7 +537,10 @@ def _make_field(col_name: str, col_type: str, current=None, prefix: str = ""):
 
     if col_type == "BOOLEAN":
         # SQLite stores booleans as 0/1
-        val = bool(int(current)) if current is not None else False
+        try:
+            val = bool(int(current)) if current is not None else False
+        except (ValueError, TypeError):
+            val = False
         return int(st.checkbox(label, value=val, key=key))
 
     if col_type == "DATE":
@@ -519,11 +551,8 @@ def _make_field(col_name: str, col_type: str, current=None, prefix: str = ""):
         return str(st.date_input(label, value=val, key=key))
 
     if col_type == "TIMESTAMP":
-        try:
-            val = datetime.fromisoformat(str(current)).date() if current else date.today()
-        except (ValueError, TypeError):
-            val = date.today()
-        return str(st.date_input(label, value=val, key=key))
+        val = str(current) if current else ""
+        return st.text_input(label, value=val, placeholder="YYYY-MM-DD HH:MM:SS", key=key)
 
     # TEXT (default)
     return st.text_input(label, value=str(current) if current is not None else "",
@@ -596,8 +625,43 @@ def chat_view():
         else:
             st.error(health_msg, icon="❌")
 
-    # ── example prompt buttons ────────────────────────────────────────────────
+        st.divider()
+        doc_count = rag_engine.doc_count(user_id)
+        rag_col, idx_col = st.columns([2, 1])
+        st.session_state.rag_enabled = rag_col.checkbox(
+            "Use RAG context",
+            value=st.session_state.rag_enabled,
+            help="Inject semantically similar rows into the system prompt before each reply.",
+        )
+        rag_col.caption(f"📚 {doc_count} docs indexed")
+        if idx_col.button("Index all", key="btn_index_all",
+                          help="Embed every table row into the vector search index"):
+            with st.spinner("Indexing all tables…"):
+                result = rag_engine.index_all_tables(user_id)
+            total = sum(v for v in result.values() if isinstance(v, int))
+            st.toast(f"Indexed {total} rows across {len(result)} tables", icon="🔍")
+
+    # ── active table selector ─────────────────────────────────────────────────
     tables = sm.get_user_tables(user_id)
+    if tables:
+        _NONE = "— none —"
+        _table_options = [_NONE] + [t["table_name"] for t in tables]
+        _current = st.session_state.chat_table or _NONE
+        if _current not in _table_options:
+            _current = _NONE
+        _tc1, _tc2 = st.columns([1, 3])
+        _tc1.markdown("📋 **Active table**")
+        _chosen_table = _tc2.selectbox(
+            "active_table",
+            _table_options,
+            index=_table_options.index(_current),
+            label_visibility="collapsed",
+            key="chat_table_sel",
+            help="Queries default to this table when none is specified",
+        )
+        st.session_state.chat_table = None if _chosen_table == _NONE else _chosen_table
+
+    # ── example prompt buttons ────────────────────────────────────────────────
     if tables:
         first = tables[0]["table_name"]
         examples = [
@@ -653,7 +717,13 @@ def chat_view():
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
-                engine = ChatEngine(sm, crud, model=st.session_state.model)
+                active_rag = rag_engine if st.session_state.rag_enabled else None
+                engine = ChatEngine(
+                    sm, crud,
+                    model=st.session_state.model,
+                    rag=active_rag,
+                    active_table=st.session_state.chat_table or "",
+                )
                 reply, tool_results = engine.chat(
                     user_id=user_id,
                     user_message=active,
@@ -686,6 +756,134 @@ def chat_view():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  IMPORT CSV VIEW
+# ═════════════════════════════════════════════════════════════════════════════
+
+def import_csv_view():
+    user_id = st.session_state.user["id"]
+    st.title("📁 Import CSV")
+    st.caption("Upload a CSV file to create a new table or append rows to an existing one.")
+
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+
+    # Clear state when the uploader is cleared
+    if uploaded is None:
+        st.session_state.csv_preview  = None
+        st.session_state.csv_filename = None
+    elif st.session_state.csv_filename != uploaded.name:
+        with st.spinner("Reading CSV…"):
+            try:
+                preview = csv_imp.read(uploaded)
+                st.session_state.csv_preview  = preview
+                st.session_state.csv_filename = uploaded.name
+            except Exception as exc:
+                st.error(f"Could not read file: {exc}")
+                st.session_state.csv_preview = None
+
+    preview = st.session_state.csv_preview
+    if preview is None:
+        return
+
+    # ── summary + data preview ────────────────────────────────────────────────
+    st.success(
+        f"**{preview['total_rows']} rows** · **{len(preview['headers'])} columns** "
+        f"detected from `{st.session_state.csv_filename}`"
+    )
+    st.markdown("#### Preview  (first 5 rows)")
+    st.dataframe(pd.DataFrame(preview["preview"]), use_container_width=True,
+                 hide_index=True)
+
+    # ── configuration ─────────────────────────────────────────────────────────
+    st.markdown("#### Configure Import")
+
+    existing_tables = [t["table_name"] for t in sm.get_user_tables(user_id)]
+    mode = st.radio(
+        "Mode",
+        ["Create new table", "Append to existing table"],
+        horizontal=True,
+        key="csv_mode",
+    )
+
+    default_name = (st.session_state.csv_filename or "imported").replace(".csv", "")
+    if mode == "Create new table":
+        table_name = st.text_input("Table name", value=default_name, key="csv_tname")
+    else:
+        if not existing_tables:
+            st.warning("No tables yet — switch to **Create new table**.")
+            return
+        table_name = st.selectbox("Append to", existing_tables, key="csv_target")
+
+    # ── column type editors ───────────────────────────────────────────────────
+    st.markdown("#### Column Types")
+    headers   = preview["headers"]
+    suggested = preview["suggested_types"]
+    col_types: Dict[str, str] = {}
+
+    cols_per_row = 3
+    for i in range(0, len(headers), cols_per_row):
+        chunk     = headers[i : i + cols_per_row]
+        ui_cols   = st.columns(cols_per_row)
+        for j, col_name in enumerate(chunk):
+            sug = suggested.get(col_name, "TEXT")
+            idx = CSV_TYPES.index(sug) if sug in CSV_TYPES else 0
+            col_types[col_name] = ui_cols[j].selectbox(
+                col_name, CSV_TYPES, index=idx, key=f"csvt_{i}_{j}"
+            )
+
+    st.divider()
+    if st.button("🚀 Import", type="primary", use_container_width=True,
+                 key="btn_do_import"):
+        _do_csv_import(user_id, preview, table_name.strip(), col_types, mode)
+
+
+def _do_csv_import(user_id, preview, table_name, col_types, mode):
+    if not table_name:
+        st.error("Table name is required")
+        return
+    df = preview["df"]
+    with st.spinner(f"Importing {preview['total_rows']} rows into '{table_name}'…"):
+        try:
+            if mode == "Create new table":
+                result = csv_imp.import_to_table(user_id, df, table_name, col_types)
+            else:
+                result = csv_imp.append_to_table(user_id, df, table_name, col_types)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+            return
+
+    if result["rows_imported"] == 0:
+        st.error("No rows were imported.")
+        for err in result["errors"]:
+            st.caption(err)
+        return
+
+    safe_name = _safe_name(table_name)
+    msg = f"Imported **{result['rows_imported']} rows** into `{safe_name}`"
+    if result["rows_failed"]:
+        msg += f" ({result['rows_failed']} rows skipped)"
+    _queue_toast(msg, icon="📁")
+
+    if result["errors"]:
+        st.warning("Some rows had errors:")
+        for err in result["errors"]:
+            st.caption(err)
+
+    # Keep the search index current after every import
+    try:
+        rag_engine.index_table(user_id, safe_name)
+    except Exception:
+        pass  # Non-critical; user can re-index manually
+
+    st.session_state.csv_preview  = None
+    st.session_state.csv_filename = None
+    _nav("table", safe_name)
+    st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -695,11 +893,26 @@ def main():
         auth_page()
         return
 
+    # Index all tables once per login session (background, non-blocking toast)
+    _ss("_rag_indexed", False)
+    if not st.session_state._rag_indexed:
+        st.session_state._rag_indexed = True
+        try:
+            user_id = st.session_state.user["id"]
+            result  = rag_engine.index_all_tables(user_id)
+            total   = sum(v for v in result.values() if isinstance(v, int))
+            if total:
+                _queue_toast(f"RAG index refreshed — {total} rows", icon="🔍")
+        except Exception:
+            pass  # Never block login on indexing failure
+
     sidebar()
 
     view = st.session_state.view
     if view == "chat":
         chat_view()
+    elif view == "import_csv":
+        import_csv_view()
     elif view == "create_table":
         create_table_view()
     elif view == "table" and st.session_state.active_table:
