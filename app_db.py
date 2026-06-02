@@ -363,7 +363,9 @@ def _tab_data(user_id, table_name, schema):
                         help="Update RAG search index for this table"):
         with st.spinner("Indexing…"):
             n = rag_engine.index_table(user_id, table_name)
-        st.toast(f"Indexed {n} rows from '{table_name}'", icon="🔍")
+        msg = (f"Re-embedded {n} new/changed row(s) in '{table_name}'"
+               if n else f"'{table_name}' already up to date")
+        st.toast(msg, icon="🔍")
 
     if not records:
         st.info("No records yet — use the **Insert** tab to add data.")
@@ -678,7 +680,9 @@ def chat_view():
             with st.spinner("Indexing all tables…"):
                 result = rag_engine.index_all_tables(user_id)
             total = sum(v for v in result.values() if isinstance(v, int))
-            st.toast(f"Indexed {total} rows across {len(result)} tables", icon="🔍")
+            msg = (f"Re-embedded {total} new/changed row(s) across {len(result)} tables"
+                   if total else "All tables already up to date")
+            st.toast(msg, icon="🔍")
 
     # ── active table selector ─────────────────────────────────────────────────
     tables = _cached_tables(user_id)
@@ -1101,7 +1105,7 @@ def main():
             result  = rag_engine.index_all_tables(user_id)
             total   = sum(v for v in result.values() if isinstance(v, int))
             if total:
-                _queue_toast(f"RAG index refreshed — {total} rows", icon="🔍")
+                _queue_toast(f"RAG index updated — {total} new/changed rows", icon="🔍")
         except Exception:
             pass  # Never block login on indexing failure
 

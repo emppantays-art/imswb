@@ -14,6 +14,7 @@ Design:
     so the chat loop degrades cleanly when Ollama is down.
 """
 
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -115,24 +116,59 @@ class RAGEngine:
 
     def index_table(self, user_id: int, table_name: str) -> int:
         """
-        (Re-)index all rows of one table.
-        Old docs for the table are replaced so edits/deletes stay current.
-        Returns the number of documents indexed.
+        Incrementally (re-)index one table.
+
+        Each row's embeddable text is content-hashed and the hash is stored in
+        the ChromaDB doc metadata. On every call we diff the current rows against
+        what's already indexed and only embed NEW or CHANGED rows, delete docs
+        for removed rows, and skip unchanged rows entirely.
+
+        This makes a no-change login cost zero Ollama embedding calls (just a
+        local ChromaDB read + hashing) instead of re-embedding every row.
+
+        Returns the number of rows actually (re-)embedded this call.
         """
         rows = self.crud.query_table(user_id, table_name, limit=INDEX_ROW_CAP)
         col  = self._col(user_id)
-        self._delete_table_docs(col, table_name)
 
-        if not rows:
-            return 0
+        # Desired state: doc_id -> (text, hash, row_id)
+        current: Dict[str, tuple] = {}
+        for r in rows:
+            doc_id = f"{table_name}__{r['id']}"
+            text   = _row_to_text(table_name, r)
+            digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+            current[doc_id] = (text, digest, r["id"])
 
-        ids       = [f"{table_name}__{r['id']}" for r in rows]
-        texts     = [_row_to_text(table_name, r) for r in rows]
-        metadatas = [{"table": table_name, "row_id": str(r["id"])} for r in rows]
-        vectors   = _embed(texts)
+        # What's already indexed for this table (hashes only — no Ollama call).
+        existing_hash: Dict[str, str] = {}
+        try:
+            got = col.get(where={"table": {"$eq": table_name}},
+                          include=["metadatas"])
+            for did, meta in zip(got.get("ids", []), got.get("metadatas", [])):
+                existing_hash[did] = (meta or {}).get("doc_hash")
+        except Exception:
+            existing_hash = {}
 
-        col.upsert(ids=ids, documents=texts, embeddings=vectors, metadatas=metadatas)
-        return len(rows)
+        # Diff
+        to_upsert = [did for did, (_, h, _) in current.items()
+                     if existing_hash.get(did) != h]          # new or changed
+        to_delete = [did for did in existing_hash if did not in current]  # removed rows
+
+        if to_delete:
+            try:
+                col.delete(ids=to_delete)
+            except Exception:
+                pass
+
+        if to_upsert:
+            texts   = [current[d][0] for d in to_upsert]
+            metas   = [{"table": table_name, "row_id": str(current[d][2]),
+                        "doc_hash": current[d][1]} for d in to_upsert]
+            vectors = _embed(texts)                            # only the diff hits Ollama
+            col.upsert(ids=to_upsert, documents=texts,
+                       embeddings=vectors, metadatas=metas)
+
+        return len(to_upsert)
 
     def index_all_tables(self, user_id: int) -> Dict[str, object]:
         """Index every table the user owns. Returns {table_name: row_count | error_str}."""
