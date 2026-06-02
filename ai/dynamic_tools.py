@@ -415,6 +415,55 @@ class ToolResult:
         return json.dumps(self.payload, default=str)
 
 
+def _coerce_columns(raw: Any) -> List[Dict]:
+    """
+    Normalise the many shapes small models emit for create_table 'columns' into
+    a list of {name, type, required, default} dicts. Accepts:
+      • a list of dicts:   [{"name": "title", "type": "TEXT"}, ...]   (canonical)
+      • a list of strings: ["title", "author"]
+      • a JSON string of any of the above
+      • a dict of columns: {"title": {"type": "TEXT"}, "price": "INTEGER"}
+    Raises ValueError (→ retryable) when it can't be parsed.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError(
+                'columns must be a JSON array of {name, type} objects, e.g. '
+                '[{"name": "title", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}]'
+            )
+
+    out: List[Dict] = []
+    if isinstance(raw, dict):
+        for cname, spec in raw.items():
+            if isinstance(spec, dict):
+                out.append({"name": cname,
+                            "type": str(spec.get("type", "TEXT")).upper(),
+                            "required": bool(spec.get("required", False)),
+                            "default": spec.get("default")})
+            else:
+                out.append({"name": cname, "type": str(spec).upper(),
+                            "required": False, "default": None})
+    elif isinstance(raw, list):
+        for c in raw:
+            if isinstance(c, dict) and c.get("name"):
+                out.append({"name": c["name"],
+                            "type": str(c.get("type", "TEXT")).upper(),
+                            "required": bool(c.get("required", False)),
+                            "default": c.get("default")})
+            elif isinstance(c, str):
+                out.append({"name": c, "type": "TEXT",
+                            "required": False, "default": None})
+
+    if not out:
+        raise ValueError(
+            'columns must be a non-empty JSON array of {name, type} objects, e.g. '
+            '[{"name": "title", "type": "TEXT"}]'
+        )
+    return out
+
+
 def execute_tool(
     name: str,
     args: Dict[str, Any],
@@ -555,16 +604,11 @@ def execute_tool(
 
         if name == "create_table":
             table_name = args["table_name"]
-            raw_cols   = args["columns"]
-            cols = [
-                {
-                    "name":     c["name"],
-                    "type":     c.get("type", "TEXT").upper(),
-                    "required": bool(c.get("required", False)),
-                    "default":  c.get("default"),
-                }
-                for c in raw_cols
-            ]
+            try:
+                cols = _coerce_columns(args.get("columns"))
+            except ValueError as exc:
+                return ToolResult(name, args, False, {"error": str(exc)},
+                                  retryable=True)
             sm.create_dynamic_table(user_id, table_name, cols)
             col_summary = ", ".join(f"{c['name']} ({c['type']})" for c in cols)
             return ToolResult(name, args, True,
