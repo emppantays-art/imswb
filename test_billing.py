@@ -150,6 +150,77 @@ def _():
     assert row["stock"] == 5, f"Stock of A should be unchanged (5), got {row['stock']}"
 
 
+@test("create_invoice: same item twice can't oversell stock (cumulative check)")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name",  "type": "TEXT"},
+        {"name": "price", "type": "FLOAT"},
+        {"name": "stock", "type": "INTEGER"},
+    ])
+    rid = crud.insert_record(uid, "shop", {"name": "Apple", "price": 1.0, "stock": 5})
+    # 3 + 3 = 6 > 5 must fail entirely, stock untouched
+    try:
+        b.create_invoice(uid, "shop",
+                         [{"item_name": "Apple", "quantity": 3},
+                          {"item_name": "Apple", "quantity": 3}], "Bob")
+        assert False, "should have rejected oversell across duplicate line items"
+    except ValueError as e:
+        assert "insufficient" in str(e).lower(), str(e)
+    assert crud.get_record(uid, "shop", rid)["stock"] == 5, "stock must be unchanged"
+    # 2 + 2 = 4 <= 5 succeeds and reduces stock once to 1
+    b.create_invoice(uid, "shop",
+                     [{"item_name": "Apple", "quantity": 2},
+                      {"item_name": "Apple", "quantity": 2}], "Bob")
+    assert crud.get_record(uid, "shop", rid)["stock"] == 1
+
+
+@test("create_invoice: exact name match wins over substring (no wrong-item billing)")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    crud.insert_record(uid, "shop", {"name": "Apple Pie", "price": 5.0})
+    crud.insert_record(uid, "shop", {"name": "Apple",     "price": 1.0})
+    inv = b.create_invoice(uid, "shop", [{"item_name": "Apple", "quantity": 1}], "X")
+    assert inv["items"][0]["unit_price"] == 1.0, "must bill exact 'Apple', not 'Apple Pie'"
+    assert abs(inv["total"] - 1.0) < 0.001
+
+
+@test("create_invoice: non-numeric stock is treated as untracked, not a crash")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "FLOAT"},
+        {"name": "stock", "type": "TEXT"}])
+    crud.insert_record(uid, "shop", {"name": "Apple", "price": 1.0, "stock": "plenty"})
+    inv = b.create_invoice(uid, "shop", [{"item_name": "Apple", "quantity": 3}], "X")
+    assert abs(inv["total"] - 3.0) < 0.001
+
+
+@test("create_invoice: non-numeric price coerces to 0, not a crash")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "cost", "type": "TEXT"}])
+    crud.insert_record(uid, "shop", {"name": "Apple", "cost": "free"})
+    inv = b.create_invoice(uid, "shop", [{"item_name": "Apple", "quantity": 2}], "X")
+    assert inv["total"] == 0.0
+
+
+@test("create_invoice: non-integer quantity raises a clear error")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    crud.insert_record(uid, "shop", {"name": "Apple", "price": 1.0})
+    try:
+        b.create_invoice(uid, "shop", [{"item_name": "Apple", "quantity": "two"}], "X")
+        assert False, "should reject non-integer quantity"
+    except ValueError as e:
+        assert "quantity" in str(e).lower(), str(e)
+
+
 @test("create_invoice: raises on unknown item")
 def _():
     sm, crud, uid, b = fresh()
@@ -164,6 +235,31 @@ def _():
         assert False, "should have raised"
     except ValueError as e:
         assert "not found" in str(e).lower(), str(e)
+
+
+@test("to_number: parses currency-formatted prices (the 'price not showing' bug)")
+def _():
+    from billing_dynamic import to_number
+    cases = {"$5.00": 5.0, "$1,234.56": 1234.56, "€10": 10.0, "10 USD": 10.0,
+             "5,99": 5.99, "1.234,56": 1234.56, "  9.99 ": 9.99,
+             "free": 0.0, "": 0.0, None: 0.0, 14.99: 14.99}
+    for raw, exp in cases.items():
+        got = to_number(raw)
+        assert abs(got - exp) < 0.001, f"to_number({raw!r}) = {got}, expected {exp}"
+
+
+@test("create_invoice: TEXT price with '$' computes correct total (not $0)")
+def _():
+    sm, crud, uid, b = fresh()
+    # CSV imports store prices as TEXT with symbols — must still bill correctly
+    sm.create_dynamic_table(uid, "products", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "TEXT"}])
+    crud.insert_record(uid, "products", {"name": "Widget", "price": "$5.00"})
+    crud.insert_record(uid, "products", {"name": "Gadget", "price": "$12.50"})
+    inv = b.create_invoice(uid, "products",
+                           [{"item_name": "Widget", "quantity": 2},
+                            {"item_name": "Gadget", "quantity": 1}], "X")
+    assert abs(inv["total"] - 22.50) < 0.01, f"got {inv['total']} (price parsing broken)"
 
 
 @test("create_invoice: raises when no price column")

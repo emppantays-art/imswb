@@ -14,7 +14,8 @@ from database.schema_manager import VALID_COLUMN_TYPES, SchemaManager, _safe_nam
 from database.dynamic_crud import DynamicCRUD
 from ai.query_parser import ChatEngine, trim_history, DEFAULT_MODEL, MEMORY_TURNS
 from ai.rag_engine import RAGEngine
-from billing_dynamic import DynamicBillingSystem
+from billing_dynamic import DynamicBillingSystem, to_number, to_stock
+from product_search import fuzzy_search
 from csv_importer import CSVImporter, VALID_TYPES as CSV_TYPES
 
 # ─── page config ─────────────────────────────────────────────────────────────
@@ -788,7 +789,7 @@ def chat_view():
             _render_tool_results([tr.__dict__ for tr in tool_results])
             # A chat turn can create tables / insert / update / create invoices,
             # so refresh the cached metadata if any mutating tool ran.
-            _MUTATING = {"add_data", "update_data", "create_table",
+            _MUTATING = {"add_data", "update_data", "delete_data", "create_table",
                          "add_column", "create_invoice"}
             if any(tr.name in _MUTATING and tr.success for tr in tool_results):
                 _invalidate_caches()
@@ -997,16 +998,37 @@ def billing_view():
 
     with left:
         st.subheader("Products")
-        products = _cached_rows(user_id, sel_table, 200)
+        all_products = _cached_rows(user_id, sel_table, 2000)
+
+        # Typo-tolerant trigram search over the product names.
+        search_q = st.text_input(
+            "🔍 Search products",
+            key="billing_search",
+            placeholder="Type a name — typo-tolerant (e.g. 'aple' finds Apple)",
+        )
+        if search_q.strip() and all_products and cols["name"]:
+            products = fuzzy_search(search_q, all_products, key=cols["name"], limit=50)
+            st.caption(f"{len(products)} match(es) for “{search_q.strip()}”")
+        else:
+            products = all_products
+            if len(products) > 50:
+                st.caption(f"Showing first 50 of {len(products)} — search to narrow down.")
+                products = products[:50]
+
         if not products:
-            st.info("No products in this table.")
+            st.info(
+                "No products in this table." if not search_q.strip()
+                else f"No products match “{search_q.strip()}”."
+            )
         else:
             for prod in products:
                 item_name  = str(prod.get(cols["name"], "?"))
-                unit_price = float(prod.get(cols["price"]) or 0)
+                unit_price = to_number(prod.get(cols["price"]))
                 stock_txt  = ""
-                if cols["stock"] and prod.get(cols["stock"]) is not None:
-                    stock_txt = f"  *(stock: {int(float(prod[cols['stock']]))})*"
+                if cols["stock"]:
+                    _s = to_stock(prod.get(cols["stock"]))
+                    if _s is not None:
+                        stock_txt = f"  *(stock: {_s})*"
                 pc1, pc2, pc3 = st.columns([4, 1, 1])
                 pc1.markdown(f"**{item_name}** — ${unit_price:.2f}{stock_txt}")
                 qty_key = f"bqty_{sel_table}_{prod['id']}"
@@ -1084,7 +1106,7 @@ def billing_view():
                 "Invoice ID":   inv.get("invoice_id", ""),
                 "Customer":     inv.get("customer_name", ""),
                 "Table":        inv.get("source_table", ""),
-                "Total":        f"${float(inv.get('total', 0)):.2f}",
+                "Total":        f"${to_number(inv.get('total')):.2f}",
                 "Date":         inv.get("date", ""),
                 "Status":       inv.get("status", ""),
             })

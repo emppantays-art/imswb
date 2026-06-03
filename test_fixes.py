@@ -189,6 +189,31 @@ def _():
     assert row["status"] == "active", f"expected 'active', got {row['status']!r}"
 
 
+@test("Fix 5d: insert_record rejects data whose keys match NO column (no blank row)")
+def _():
+    # The 'shows successful but doesn't reflect' bug: mismatched column names
+    # used to slip through to INSERT DEFAULT VALUES, inserting a blank row and
+    # reporting success while the caller's data was silently dropped.
+    sm, crud, uid = fresh_db()
+    sm.create_dynamic_table(uid, "books", [
+        {"name": "title", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    try:
+        crud.insert_record(uid, "books", {"book_title": "1984", "cost": 9.99})
+        assert False, "should reject data with no matching columns"
+    except ValueError as e:
+        assert "match" in str(e).lower(), str(e)
+    assert crud.count_records(uid, "books") == 0, "no blank row should have been inserted"
+
+
+@test("Fix 5e: insert_record still inserts the matching subset on partial mismatch")
+def _():
+    sm, crud, uid = fresh_db()
+    sm.create_dynamic_table(uid, "books", [
+        {"name": "title", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    rid = crud.insert_record(uid, "books", {"title": "Dune", "bogus": 1})
+    assert crud.get_record(uid, "books", rid)["title"] == "Dune"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fix 6 — count_records raises on missing table instead of silently returning 0
 # ─────────────────────────────────────────────────────────────────────────────

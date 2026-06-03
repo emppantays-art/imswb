@@ -117,6 +117,9 @@ Rules:
    NEVER say "No records found" when count > 0. Never make up rows.
 5. UPDATE: Call query_data first to get the record id, then call update_data with that id.
    Skip the query only when the user explicitly gives an integer id (e.g. "id=5").
+5b. DELETE: To remove a record, call query_data first to get its integer id, then call
+   delete_data with that id. NEVER claim a record was deleted without calling delete_data —
+   there is a real delete_data tool, so use it. Do not invent a deletion.
 6. STOP → [text]: copy [text] word-for-word. Do not call any more tools.
 7. TOOL FAILED: [msg]: reply "Error: [msg]". Do not call any more tools.
    Never say "No records found" for a failed insert or update.
@@ -124,6 +127,35 @@ Rules:
    (pure geography, math, weather, etc.) → briefly explain you are a database
    assistant and mention the available tables. Do NOT apply this rule to questions
    about data values, items, or records — always call query_data when in doubt."""
+
+
+# Command/filler words that aren't the name of a record the user wants to delete.
+_DELETE_STOPWORDS = {
+    "delete", "remove", "drop", "erase", "the", "a", "an", "book", "record",
+    "row", "item", "entry", "data", "from", "table", "please", "this", "that",
+    "it", "its", "one", "ones", "last", "first", "newest", "oldest", "my", "of",
+    "in", "with", "and", "id", "number", "all", "for", "to", "by",
+}
+
+
+def _delete_target_ok(record: Dict, user_message: str) -> bool:
+    """
+    Safety check before deleting `record`: return True only if it's a sound
+    target for this request. Small models, when they can't find the named item,
+    will happily delete an arbitrary row — so we verify the user's named entity
+    actually appears in the record's values. Purely contextual/positional
+    requests ("delete it", "the last one", "id 5") carry no entity tokens and
+    are allowed through.
+    """
+    toks = [w for w in re.findall(r"[a-z0-9]+", user_message.lower())
+            if len(w) >= 3 and w not in _DELETE_STOPWORDS]
+    if not toks:
+        return True
+    values = " ".join(
+        str(v).lower() for k, v in record.items()
+        if k not in ("id", "created_at", "updated_at") and v is not None
+    )
+    return any(t in values for t in toks)
 
 
 class ChatEngine:
@@ -194,7 +226,8 @@ class ChatEngine:
         tools     = build_tools(user_id, self.sm, billing=self.billing)
         all_tools: List[ToolResult] = []
         _update_nudge_sent = False
-        _in_update_flow = False   # True after retryable update_data failure → suppress post-query nudge
+        _in_update_flow = False   # True after retryable update/delete failure → suppress post-query nudge
+        _pending_op = "update"    # which write the query-first flow is leading to: "update" or "delete"
         _schema_dirty = False     # set when create_table/add_column runs → rebuild tools only then
 
         # Pre-flight: detect explicit nonexistent-table mention in the user message
@@ -324,6 +357,33 @@ class ChatEngine:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
+                # Enforce the pinned active table. The model often anchors to a
+                # table from earlier in the conversation (via history) and picks
+                # it even after the user switches the Active-table dropdown. If a
+                # table is pinned and the model chose a DIFFERENT table that the
+                # user did NOT name in this turn's message, override it to the pin.
+                if (active_table and isinstance(args, dict)
+                        and name in ("query_data", "add_data", "update_data", "delete_data")):
+                    _chosen = str(args.get("table_name") or "").strip()
+                    if (_chosen and _chosen.lower() != active_table.lower()
+                            and _chosen.lower() not in user_message.lower()):
+                        args = dict(args)
+                        args["table_name"] = active_table
+
+                # Safety guard: never delete a record that doesn't match what the
+                # user named. Small models pick an arbitrary id when they can't
+                # find the target — this prevents wrongful deletions. (Runs after
+                # the pin override so it checks the record in the resolved table.)
+                if name == "delete_data" and isinstance(args, dict) and args.get("record_id") is not None:
+                    _tbl = (args.get("table_name") or active_table or "").strip().lower()
+                    try:
+                        _target = self.crud.get_record(user_id, _tbl, int(args["record_id"]))
+                    except Exception:
+                        _target = None
+                    if _target and not _delete_target_ok(_target, user_message):
+                        return ("I couldn't find a record matching that request, "
+                                "so nothing was deleted."), all_tools
+
                 result = execute_tool(name, args, user_id, self.sm, self.crud,
                                      default_table=active_table, billing=self.billing)
                 all_tools.append(result)
@@ -337,9 +397,17 @@ class ChatEngine:
 
                 # Non-retryable update failure (e.g. record not found) — stop the
                 # loop immediately so the model cannot substitute a different record.
-                if name == "update_data" and not result.success and not result.retryable:
-                    _err = result.payload.get("error", "Update failed")
+                if name in ("update_data", "delete_data") and not result.success and not result.retryable:
+                    _err = result.payload.get("error", "Operation failed")
                     return f"Error: {_err}", all_tools
+
+                # Return immediately after a successful delete — a real tool ran,
+                # so confirm deterministically instead of letting the model
+                # hallucinate (it used to claim deletions with no delete tool).
+                if name == "delete_data" and result.success:
+                    _rec = result.payload.get("deleted_id", "")
+                    _tbl = result.args.get("table_name", "the table")
+                    return f"Deleted record {_rec} from {_tbl}.", all_tools
 
                 # Return immediately after successful update_data — prevents
                 # post-update query loops even when model batches tool calls.
@@ -399,11 +467,26 @@ class ChatEngine:
                     if _retry.success and _retry.payload.get("count", 0) > 0:
                         last = _retry
 
+            # Nudge when delete_data fails retryably (usually a missing id).
+            if last and last.name == "delete_data" and last.retryable:
+                table = last.args.get("table_name", "the table")
+                _in_update_flow = True
+                _pending_op = "delete"
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"You need to find the record first. "
+                        f"Call query_data on '{table}' to get the row and its integer id, "
+                        "then call delete_data with that id."
+                    ),
+                })
+
             # Nudge when update_data fails retryably
-            if last and last.name == "update_data" and last.retryable:
+            elif last and last.name == "update_data" and last.retryable:
                 table = last.args.get("table_name", "the table")
                 if _round == 0:
                     _in_update_flow = True
+                    _pending_op = "update"
                     _cols0 = sorted(
                         c["column_name"]
                         for c in (self.sm.get_table_schema(user_id, table) or [])
@@ -464,11 +547,12 @@ class ChatEngine:
                         )
                         for r in _d[:10]
                     )
+                    _tool = "delete_data" if _pending_op == "delete" else "update_data"
                     messages.append({
                         "role": "user",
                         "content": (
                             f"Found {len(_d)} record(s). Based on the user's request, "
-                            "identify the correct one and call update_data with its integer id.\n"
+                            f"identify the correct one and call {_tool} with its integer id.\n"
                             f"Available records: {_rows_desc}"
                         ),
                     })
@@ -576,7 +660,7 @@ def _clean_reply(text: str) -> str:
     text = re.sub(r'\{"name"\s*:\s*"[^"]+"\s*,\s*"parameters"[^}]*\}[^"]*\}?',
                   '', text, flags=re.DOTALL)
     # Python function-call style: query_data(...) / add_data(...)
-    text = re.sub(r'\b(query_data|add_data|update_data|create_table|add_column)\s*\([^)]*\)',
+    text = re.sub(r'\b(query_data|add_data|update_data|delete_data|create_table|add_column)\s*\([^)]*\)',
                   '', text, flags=re.DOTALL)
     # Generic call_tool("name", {...}) leakage from some model builds
     text = re.sub(r'\bcall_tool\s*\([^)]*\)', '', text, flags=re.DOTALL)
