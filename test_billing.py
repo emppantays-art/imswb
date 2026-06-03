@@ -66,6 +66,48 @@ def _():
     assert cols["name"]  is None
 
 
+@test("detect_columns: one column never fills two roles (item_price → price only)")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "t", [
+        {"name": "item_price", "type": "FLOAT"},   # matches both 'item' (name) and 'price'
+        {"name": "product", "type": "TEXT"},
+        {"name": "qty", "type": "INTEGER"}])
+    cols = b.detect_columns(uid, "t")
+    assert cols["price"] == "item_price"
+    assert cols["name"] == "product"          # NOT item_price
+    assert cols["stock"] == "qty"
+    assert cols["name"] != cols["price"]
+
+
+@test("generate_receipt_html: escapes HTML in item/customer names (XSS guard)")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    crud.insert_record(uid, "shop", {"name": "<script>x</script>", "price": 5.0})
+    inv = b.create_invoice(uid, "shop",
+                           [{"item_name": "<script>x</script>", "quantity": 1}],
+                           "<img src=x onerror=alert(1)>")
+    html_out = b.generate_receipt_html(inv)
+    assert "<script>x" not in html_out, "raw <script> leaked into receipt"
+    assert "<img src=x onerror" not in html_out
+    assert "&lt;script&gt;" in html_out      # present, but escaped
+
+
+@test("create_invoice: rejects an empty item list (no junk $0 invoice)")
+def _():
+    sm, crud, uid, b = fresh()
+    sm.create_dynamic_table(uid, "shop", [
+        {"name": "name", "type": "TEXT"}, {"name": "price", "type": "FLOAT"}])
+    crud.insert_record(uid, "shop", {"name": "X", "price": 2.0})
+    try:
+        b.create_invoice(uid, "shop", [], "Customer")
+        assert False, "should reject empty items"
+    except ValueError as e:
+        assert "no items" in str(e).lower(), str(e)
+
+
 # ── 2. Invoice creation ───────────────────────────────────────────────────────
 
 @test("create_invoice: happy path, correct totals, invoices table created")
