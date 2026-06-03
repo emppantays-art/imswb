@@ -1,0 +1,18 @@
+# Production server config for Dynamic DB Studio.
+# TLS termination + rate limiting are expected to be handled by a reverse proxy
+# (nginx/Caddy/Traefik) in front of this container.
+
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+enableXsrfProtection = true   # CSRF protection on
+enableCORS = true             # leave on; the reverse proxy is same-origin
+maxUploadSize = 50            # MB cap for CSV uploads
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = false      # don't leak tracebacks to end users in prod
+toolbarMode = "minimal"

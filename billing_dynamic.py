@@ -5,6 +5,7 @@ Works by keyword-matching column names to detect price / name / stock columns �
 no hardcoded table or column names required.
 """
 
+import html
 import json
 import random
 import re
@@ -102,14 +103,22 @@ class DynamicBillingSystem:
         """
         schema = self.sm.get_table_schema(user_id, table_name) or []
         result: Dict[str, Optional[str]] = {"price": None, "name": None, "stock": None}
+        used: set = set()
+        # Assign each column to AT MOST one role. When a column matches several
+        # keyword sets (e.g. 'item_price' matches both name and price), the more
+        # specific role wins: price > stock > name. Without this, a single column
+        # could fill two roles and break billing (name == price).
         for col in schema:
-            low = col["column_name"].lower()
+            cname = col["column_name"]
+            low = cname.lower()
+            if cname in used:
+                continue
             if result["price"] is None and any(kw in low for kw in self.PRICE_KEYWORDS):
-                result["price"] = col["column_name"]
-            if result["name"]  is None and any(kw in low for kw in self.NAME_KEYWORDS):
-                result["name"]  = col["column_name"]
-            if result["stock"] is None and any(kw in low for kw in self.STOCK_KEYWORDS):
-                result["stock"] = col["column_name"]
+                result["price"] = cname; used.add(cname)
+            elif result["stock"] is None and any(kw in low for kw in self.STOCK_KEYWORDS):
+                result["stock"] = cname; used.add(cname)
+            elif result["name"] is None and any(kw in low for kw in self.NAME_KEYWORDS):
+                result["name"] = cname; used.add(cname)
         return result
 
     def billable_tables(self, user_id: int) -> List[str]:
@@ -182,6 +191,8 @@ class DynamicBillingSystem:
         The stock reduction is applied atomically — if any item fails the whole
         transaction is aborted before any DB write.
         """
+        if not items:
+            raise ValueError("Cannot create an invoice with no items.")
         cols = self.detect_columns(user_id, table_name)
         if not cols["price"]:
             raise ValueError(
@@ -309,10 +320,13 @@ class DynamicBillingSystem:
         if isinstance(items, str):          # stored as JSON string in DB
             items = json.loads(items)
 
+        # Escape every user-controlled value — this HTML is rendered raw via
+        # st.components.html, so an item/customer name like "<script>…</script>"
+        # would otherwise execute (stored XSS).
         rows_html = "".join(
             f"<tr>"
-            f"<td>{it['item_name']}</td>"
-            f"<td style='text-align:center'>{it['quantity']}</td>"
+            f"<td>{html.escape(str(it['item_name']))}</td>"
+            f"<td style='text-align:center'>{int(it['quantity'])}</td>"
             f"<td style='text-align:right'>${float(it['unit_price']):.2f}</td>"
             f"<td style='text-align:right'>${float(it['subtotal']):.2f}</td>"
             f"</tr>"
@@ -338,9 +352,9 @@ class DynamicBillingSystem:
 <body>
   <h2>🧾 RECEIPT</h2>
   <div class="meta">
-    <strong>Invoice :</strong> {invoice['invoice_id']}<br>
-    <strong>Customer:</strong> {invoice['customer_name']}<br>
-    <strong>Date    :</strong> {invoice['date']}
+    <strong>Invoice :</strong> {html.escape(str(invoice['invoice_id']))}<br>
+    <strong>Customer:</strong> {html.escape(str(invoice['customer_name']))}<br>
+    <strong>Date    :</strong> {html.escape(str(invoice['date']))}
   </div>
   <table>
     <tr><th>Item</th><th>Qty</th><th>Unit</th><th>Total</th></tr>

@@ -1,0 +1,57 @@
+# Dynamic DB Studio — production stack (app + co-located Ollama).
+#
+#   docker compose up -d --build
+#
+# Services:
+#   ollama       — the LLM/embeddings server (same host as the app)
+#   ollama-pull  — one-shot: pulls the models the app needs, then exits
+#   app          — the Streamlit UI, reaches Ollama at http://ollama:11434
+#
+# Persistent data lives in two named volumes (survives container rebuilds):
+#   ollama_models — pulled model weights (~2.3 GB)
+#   app_data      — per-user SQLite DBs + ChromaDB vector store
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # Uncomment to expose Ollama on the host (not required; app reaches it
+    # over the internal network):
+    # ports:
+    #   - "11434:11434"
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c",
+      "ollama pull llama3.2:3b && ollama pull nomic-embed-text && echo 'models ready'"]
+    restart: "no"
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    ports:
+      - "8501:8501"
+    volumes:
+      - app_data:/app/data
+
+volumes:
+  ollama_models:
+  app_data:

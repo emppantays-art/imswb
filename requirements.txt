@@ -1,4 +1,6 @@
-streamlit>=1.32.0
-pandas>=2.0.0
-ollama>=0.3.0
-chromadb>=1.0.0
+# Pinned for reproducible production builds (versions verified in the working env).
+streamlit==1.58.0
+pandas==3.0.3
+ollama==0.6.2
+chromadb==1.5.9
+numpy==2.4.6
