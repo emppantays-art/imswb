@@ -176,6 +176,35 @@ def build_tools(user_id: int, sm: SchemaManager, billing=None) -> List[Dict]:
             },
         },
 
+        # ── delete_data ───────────────────────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_data",
+                "description": (
+                    "Delete a record from a table by its integer id. "
+                    f"Available tables: {table_desc}. "
+                    "ALWAYS call query_data first to find the record and get its id. "
+                    "NEVER guess or assume an id — only use an id returned by a "
+                    "prior query_data call in this conversation."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["table_name", "record_id"],
+                    "properties": {
+                        "table_name": {
+                            "type": "string",
+                            "description": "Name of the table",
+                        },
+                        "record_id": {
+                            "type": "integer",
+                            "description": "Integer primary key (id column) of the row to delete",
+                        },
+                    },
+                },
+            },
+        },
+
         # ── create_table ──────────────────────────────────────────────────────
         {
             "type": "function",
@@ -531,6 +560,12 @@ def execute_tool(
                         args = dict(args)
                         args["table_name"] = table
             data   = args.get("data", {})
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)   # model often sends a JSON string
+                    args = dict(args); args["data"] = data   # keep ToolResult consistent
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if not isinstance(data, dict):
                 cols = [c["column_name"]
                         for c in (sm.get_table_schema(user_id, table) or [])]
@@ -540,7 +575,15 @@ def execute_tool(
                     f"e.g. {json.dumps(example)}. "
                     f"Available columns: {', '.join(cols)}."
                 )}, retryable=True)
-            new_id = crud.insert_record(user_id, table, data)
+            try:
+                new_id = crud.insert_record(user_id, table, data)
+            except ValueError as exc:
+                cols = [c["column_name"]
+                        for c in (sm.get_table_schema(user_id, table) or [])]
+                return ToolResult(name, args, False, {"error": (
+                    f"{exc} Provide the data using exactly these column names: "
+                    f"{', '.join(cols)}."
+                )}, retryable=True)
             return ToolResult(name, args, True,
                               {"inserted_id": new_id,
                                "message": f"Inserted record id={new_id}"})
@@ -573,6 +616,12 @@ def execute_tool(
                     "Search for the record first using query_data, then pass its numeric id here."
                 )}, retryable=True)
             updates   = args.get("updates", {})
+            if isinstance(updates, str):
+                try:
+                    updates = json.loads(updates)   # model often sends a JSON string
+                    args = dict(args); args["updates"] = updates   # keep ToolResult consistent
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if not isinstance(updates, dict):
                 cols = [c["column_name"]
                         for c in (sm.get_table_schema(user_id, table) or [])]
@@ -599,6 +648,41 @@ def execute_tool(
                 return ToolResult(name, args, True,
                                   {"updated_id": record_id,
                                    "message": f"Record {record_id} updated"})
+            return ToolResult(name, args, False,
+                              {"error": f"No record with id={record_id}"})
+
+        if name == "delete_data":
+            table  = args.get("table_name") or ""
+            if not table:
+                if default_table:
+                    table = default_table
+                    args = dict(args)
+                    args["table_name"] = table
+                else:
+                    _all_tables = sm.get_user_tables(user_id)
+                    if len(_all_tables) == 1:
+                        table = _all_tables[0]["table_name"]
+                        args = dict(args)
+                        args["table_name"] = table
+            raw_id = args.get("record_id")
+            if raw_id is None or str(raw_id).strip() == "":
+                return ToolResult(name, args, False, {"error": (
+                    "record_id is missing or empty. You MUST call query_data first "
+                    "to locate the record and obtain its integer id. Then call "
+                    "delete_data with that id."
+                )}, retryable=True)
+            try:
+                record_id = int(raw_id)
+            except (ValueError, TypeError):
+                return ToolResult(name, args, False, {"error": (
+                    f"record_id must be an integer, got {raw_id!r}. "
+                    "Search for the record first using query_data, then pass its numeric id here."
+                )}, retryable=True)
+            deleted = crud.delete_record(user_id, table, record_id)
+            if deleted:
+                return ToolResult(name, args, True,
+                                  {"deleted_id": record_id,
+                                   "message": f"Record {record_id} deleted from '{table}'"})
             return ToolResult(name, args, False,
                               {"error": f"No record with id={record_id}"})
 

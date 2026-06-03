@@ -7,12 +7,73 @@ no hardcoded table or column names required.
 
 import json
 import random
+import re
 import string
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from database.schema_manager import SchemaManager
 from database.dynamic_crud import DynamicCRUD
+
+# First number-looking token in a string (handles "$5.00", "10 USD", "€1,234.56").
+_NUM_TOKEN = re.compile(r"[-+]?\d[\d.,]*\d|\d")
+
+
+def _parse_number(val: Any) -> Optional[float]:
+    """
+    Robustly parse a numeric value out of messy real-world input. CSV imports
+    store everything as TEXT, so prices commonly arrive as '$5.00', '1,234.56',
+    '€10', '10 USD', or European '5,99' — plain float() loses all of those.
+
+    Returns the float, or None if there's no number at all (e.g. 'free', '').
+    Handles currency symbols/units, thousands separators, and US/EU decimals.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):           # avoid True/False → 1.0/0.0 surprises
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    m = _NUM_TOKEN.search(s)
+    if not m:
+        return None
+    tok = m.group(0)
+    if "," in tok and "." in tok:
+        # Both present → the LAST separator is the decimal point.
+        if tok.rfind(",") > tok.rfind("."):
+            tok = tok.replace(".", "").replace(",", ".")   # EU: 1.234,56
+        else:
+            tok = tok.replace(",", "")                      # US: 1,234.56
+    elif "," in tok:
+        parts = tok.split(",")
+        # "5,99" → decimal comma; "1,234" / "1,234,567" → thousands separators.
+        if len(parts) == 2 and len(parts[-1]) == 2:
+            tok = tok.replace(",", ".")
+        else:
+            tok = tok.replace(",", "")
+    try:
+        return float(tok)
+    except ValueError:
+        return None
+
+
+def to_number(val: Any) -> float:
+    """Parse a price-like value to float; 0.0 if blank/non-numeric (never raises)."""
+    n = _parse_number(val)
+    return n if n is not None else 0.0
+
+
+def to_stock(val: Any) -> Optional[int]:
+    """
+    Parse a stock-like value to int. Returns None when the value isn't a
+    trackable number (blank, text like 'plenty', etc.) so callers can treat
+    that row as 'stock not tracked' instead of crashing.
+    """
+    n = _parse_number(val)
+    return int(n) if n is not None else None
 
 
 class DynamicBillingSystem:
@@ -79,6 +140,24 @@ class DynamicBillingSystem:
                 {"name": "status",        "type": "TEXT",  "default": "paid"},
             ])
 
+    # ── item lookup ──────────────────────────────────────────────────────────
+
+    def _find_item(self, user_id: int, table_name: str,
+                   name_col: str, item_name: str) -> Optional[Dict]:
+        """
+        Resolve an item name to a single row. Prefers an exact (case-insensitive)
+        name match over a substring match, so asking for 'Apple' never silently
+        bills 'Apple Pie'. Returns None if nothing matches at all.
+        """
+        rows = self.crud.search_table(user_id, table_name, name_col, item_name, limit=25)
+        if not rows:
+            return None
+        target = item_name.strip().lower()
+        for r in rows:
+            if str(r.get(name_col, "")).strip().lower() == target:
+                return r
+        return rows[0]   # no exact match — fall back to the first substring hit
+
     # ── create invoice ───────────────────────────────────────────────────────
 
     def create_invoice(
@@ -117,34 +196,39 @@ class DynamicBillingSystem:
 
         line_items: List[Dict] = []
         total = 0.0
-        # Collect all stock updates before writing anything (atomicity)
-        pending_stock: List[tuple] = []   # (record_id, col_name, new_value)
+        # Track per-row state so the same item appearing in several line items is
+        # checked against ONE cumulative quantity (prevents overselling), and so
+        # stock is reduced once per row by the total quantity sold.
+        rows_by_id: Dict[int, Dict] = {}
+        qty_by_id:  Dict[int, int]  = {}
 
         for entry in items:
-            item_name = str(entry["item_name"]).strip()
-            qty = int(entry["quantity"])
+            item_name = str(entry.get("item_name", "")).strip()
+            try:
+                qty = int(entry.get("quantity"))
+            except (ValueError, TypeError):
+                raise ValueError(f"Quantity for '{item_name}' must be a positive integer.")
             if qty <= 0:
                 raise ValueError(f"Quantity for '{item_name}' must be a positive integer.")
 
-            # Find matching row (case-insensitive LIKE search)
-            rows = self.crud.search_table(user_id, table_name, cols["name"], item_name, limit=10)
-            if not rows:
+            row = self._find_item(user_id, table_name, cols["name"], item_name)
+            if row is None:
                 raise ValueError(f"Item '{item_name}' not found in '{table_name}'.")
-            row = rows[0]
+            rid = row["id"]
+            rows_by_id[rid] = row
+            qty_by_id[rid]  = qty_by_id.get(rid, 0) + qty
 
-            unit_price = float(row.get(cols["price"]) or 0)
+            unit_price = to_number(row.get(cols["price"]))
             subtotal   = round(unit_price * qty, 2)
 
+            # Stock check against the CUMULATIVE quantity requested for this row.
             if cols["stock"]:
-                raw = row.get(cols["stock"])
-                if raw is not None:
-                    current = int(float(raw))
-                    if current < qty:
-                        raise ValueError(
-                            f"Insufficient stock for '{item_name}': "
-                            f"requested {qty}, available {current}."
-                        )
-                    pending_stock.append((row["id"], cols["stock"], current - qty))
+                avail = to_stock(row.get(cols["stock"]))
+                if avail is not None and qty_by_id[rid] > avail:
+                    raise ValueError(
+                        f"Insufficient stock for '{item_name}': "
+                        f"requested {qty_by_id[rid]}, available {avail}."
+                    )
 
             line_items.append({
                 "item_name":  item_name,
@@ -154,9 +238,14 @@ class DynamicBillingSystem:
             })
             total += subtotal
 
-        # All validation passed — apply stock reductions
-        for record_id, stock_col, new_val in pending_stock:
-            self.crud.update_record(user_id, table_name, record_id, {stock_col: new_val})
+        # All validation passed — reduce stock once per row by total sold.
+        if cols["stock"]:
+            for rid, sold in qty_by_id.items():
+                avail = to_stock(rows_by_id[rid].get(cols["stock"]))
+                if avail is not None:
+                    self.crud.update_record(
+                        user_id, table_name, rid, {cols["stock"]: avail - sold}
+                    )
 
         # Generate invoice ID: INV-YYYYMMDD-XXXX
         now        = datetime.now()
@@ -195,7 +284,7 @@ class DynamicBillingSystem:
             user_id, self.INVOICES_TABLE, filters={"date": date}, limit=1000
         )
         count   = len(rows)
-        revenue = sum(float(r.get("total", 0)) for r in rows)
+        revenue = sum(to_number(r.get("total")) for r in rows)
         avg     = round(revenue / count, 2) if count else 0.0
         return {
             "date":           date,
