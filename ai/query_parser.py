@@ -357,9 +357,23 @@ class ChatEngine:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
+                # Enforce the pinned active table. The model often anchors to a
+                # table from earlier in the conversation (via history) and picks
+                # it even after the user switches the Active-table dropdown. If a
+                # table is pinned and the model chose a DIFFERENT table that the
+                # user did NOT name in this turn's message, override it to the pin.
+                if (active_table and isinstance(args, dict)
+                        and name in ("query_data", "add_data", "update_data", "delete_data")):
+                    _chosen = str(args.get("table_name") or "").strip()
+                    if (_chosen and _chosen.lower() != active_table.lower()
+                            and _chosen.lower() not in user_message.lower()):
+                        args = dict(args)
+                        args["table_name"] = active_table
+
                 # Safety guard: never delete a record that doesn't match what the
                 # user named. Small models pick an arbitrary id when they can't
-                # find the target — this prevents wrongful deletions.
+                # find the target — this prevents wrongful deletions. (Runs after
+                # the pin override so it checks the record in the resolved table.)
                 if name == "delete_data" and isinstance(args, dict) and args.get("record_id") is not None:
                     _tbl = (args.get("table_name") or active_table or "").strip().lower()
                     try:
