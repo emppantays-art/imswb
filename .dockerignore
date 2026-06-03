@@ -1,0 +1,26 @@
+# Keep the build context (and image) lean.
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local data — never bake user DBs / vector store into the image.
+data/
+data_test/
+data_test2/
+
+# Tests, screenshots, dev scratch.
+test_*.py
+rag_diagnosis.py
+/tmp/
+*.log
+
+# Docs/CI that don't belong in the runtime image.
+.github/
+nexus/
+*.md
+!README.md
