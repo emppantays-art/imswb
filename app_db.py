@@ -789,7 +789,7 @@ def chat_view():
             _render_tool_results([tr.__dict__ for tr in tool_results])
             # A chat turn can create tables / insert / update / create invoices,
             # so refresh the cached metadata if any mutating tool ran.
-            _MUTATING = {"add_data", "update_data", "create_table",
+            _MUTATING = {"add_data", "update_data", "delete_data", "create_table",
                          "add_column", "create_invoice"}
             if any(tr.name in _MUTATING and tr.success for tr in tool_results):
                 _invalidate_caches()
